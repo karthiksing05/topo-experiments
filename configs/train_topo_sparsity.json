@@ -26,9 +26,9 @@
       "topo_scale":     10.0,
       "factor_h":        4.0,
       "factor_w":        4.0,
-      "lambda_kl":       2.0,
-      "lambda_entropy":  3.0,
-      "temperature":     5.0
+      "lambda_kl":       0.0,
+      "lambda_entropy":  5.0,
+      "temperature":     1.0
     }
   }
 }
