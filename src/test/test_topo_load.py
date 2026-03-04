@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import toponets
-from topoloss.cortical_sheet.output import get_cortical_sheet_linear
+from topoloss.cortical_sheet.output import get_cortical_sheet_linear, get_cortical_sheet_conv
 
 # Derive base experiment directory two levels up from this file
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -59,6 +59,11 @@ def _get_sheet(layer: nn.Module, strict: bool = True):
     return get_cortical_sheet_linear(layer=layer, strict_layer_type=strict).cpu().detach()
 
 
+def _get_conv_sheet(layer: nn.Conv2d):
+    # Returns (H, W, in_channels * kH * kW) — use get_cortical_sheet_conv, not the linear variant
+    return get_cortical_sheet_conv(layer=layer, strict_layer_type=True).cpu().detach()
+
+
 def _find_residual_conv_layers(model: nn.Module):
     """
     Return [(name, layer)] for every Conv2d that lives inside a residual block
@@ -107,10 +112,15 @@ def save_conv_cortical_sheets(model: nn.Module, model_family: str, tau: float):
         for idx, (name, layer) in enumerate(convs):
             ax = axes_flat[idx]
             try:
-                sheet = _get_sheet(layer, strict=False)  # (H, W, in_channels)
-                ax.imshow(sheet[:, :, 0].numpy(), cmap="RdBu")
+                sheet = _get_conv_sheet(layer)  # (H, W, in_channels * kH * kW)
+                data = sheet[:, :, 0].numpy().astype(float)
+                lo, hi = data.min(), data.max()
+                if hi > lo:
+                    data = (data - lo) / (hi - lo)
+                ax.imshow(data, cmap="RdBu", vmin=0, vmax=1)
             except Exception as exc:
-                ax.text(0.5, 0.5, str(exc), ha="center", va="center", fontsize=7, wrap=True)
+                ax.text(0.5, 0.5, str(exc), ha="center", va="center", fontsize=8,
+                        transform=ax.transAxes, wrap=True, color="red")
             ax.set_title(name.replace(stage + ".", "") + f"\n{tuple(layer.weight.shape)}", fontsize=9)
             ax.axis("off")
 
