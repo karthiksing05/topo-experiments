@@ -105,7 +105,7 @@ fi
 [[ "${PRETRAINED}" == "1" || "${PRETRAINED}" == "true" ]] \
     && OVERRIDE_ARGS+=" --pretrained"
 
-srun python -u src/train/train_topo_sparsity_large.py \
+srun python -u examples/train/train_topo_sparsity_large.py \
     --config "${CONFIG_FILE}" \
     ${OVERRIDE_ARGS}
 

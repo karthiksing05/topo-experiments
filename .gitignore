@@ -5,3 +5,4 @@ topomodels
 outputs
 data
 litcoder_token
+__pycache__

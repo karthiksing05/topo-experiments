@@ -22,6 +22,9 @@ import copy
 import json
 import math
 from pathlib import Path
+import contextlib
+from datetime import datetime
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
@@ -490,13 +493,6 @@ def save_activation_cortical_sheets(
                 f"{lbl}\n{name}", fontsize=7, pad=3
             )
 
-    # Dividers between model groups
-    for m_idx in range(1, n_models):
-        div_x = (1 + m_idx * n_lay) / n_cols
-        fig.add_artist(plt.Line2D([div_x, div_x], [0, 1],
-                                  transform=fig.transFigure,
-                                  color="steelblue", linestyle="--", linewidth=1.2))
-
     for row, cls in enumerate(range(n_classes)):
         img_tensor = example_imgs[cls]
         model_acts = {lbl: _get_layer_acts(mdl, img_tensor)
@@ -524,10 +520,347 @@ def save_activation_cortical_sheets(
         y=1.003, fontsize=9,
     )
     plt.tight_layout()
+    for m_idx in range(1, n_models):
+        ax_r = axes[0, 1 + m_idx * n_lay - 1]
+        ax_l = axes[0, 1 + m_idx * n_lay]
+        x = (ax_r.get_position().x1 + ax_l.get_position().x0) / 2
+        fig.add_artist(plt.Line2D([x, x], [0.02, 0.93],
+                                   transform=fig.transFigure,
+                                   color="steelblue", linestyle="--", linewidth=1.2,
+                                   clip_on=False))
     path = out_dir / "activation_cortical_sheets.png"
     fig.savefig(path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     print(f"  Saved activation cortical sheets -> {path}")
+
+
+def save_per_category_activation_comparisons(
+    models: dict,
+    val_loader: DataLoader,
+    out_dir: Path,
+    device: str,
+    n_samples: int = 4,
+) -> None:
+    """For each Fashion-MNIST category save one figure with n_samples rows.
+
+    Layout: rows = samples, cols = [input | model0/fc1 | model0/fc2 | model1/fc1 | ...]
+    A dashed vertical divider (drawn after tight_layout) separates model groups.
+    Saved to out_dir/activation_per_category_{class_name}.png
+    """
+    print("  Generating per-category activation cortical-sheet comparisons ...")
+    model_items = list(models.items())
+    n_models    = len(model_items)
+    n_lay       = len(VIS_LAYER_NAMES)
+    n_cols      = 1 + n_models * n_lay
+
+    def _get_layer_acts(model: SimpleNN, img: torch.Tensor) -> dict:
+        store   = {}
+        handles = []
+        for name in VIS_LAYER_NAMES:
+            layer = getattr(model, name)
+            def _make_hook(n):
+                def _h(_m, _i, out):
+                    store[n] = out[0]
+                return _h
+            handles.append(layer.register_forward_hook(_make_hook(name)))
+        model.eval()
+        with torch.no_grad():
+            model(img.to(device))
+        for h in handles:
+            h.remove()
+        return store
+
+    # Collect n_samples images per class from val set
+    samples_per_class: dict = {cls: [] for cls in range(len(FMNIST_CLASSES))}
+    for imgs, lbls in val_loader:
+        for cls in range(len(FMNIST_CLASSES)):
+            if len(samples_per_class[cls]) < n_samples:
+                idx = (lbls == cls).nonzero(as_tuple=True)[0]
+                for i in idx:
+                    if len(samples_per_class[cls]) < n_samples:
+                        samples_per_class[cls].append(imgs[i:i+1])
+        if all(len(v) >= n_samples for v in samples_per_class.values()):
+            break
+
+    for cls in range(len(FMNIST_CLASSES)):
+        cls_name     = FMNIST_CLASSES[cls]
+        sample_list  = samples_per_class[cls][:n_samples]
+        n_rows       = len(sample_list)
+
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(n_cols * 1.8, n_rows * 1.8),
+            squeeze=False,
+        )
+
+        # Column headers
+        axes[0, 0].set_title("Input", fontsize=8, pad=3)
+        for m_idx, (lbl, _) in enumerate(model_items):
+            for i, name in enumerate(VIS_LAYER_NAMES):
+                axes[0, 1 + m_idx * n_lay + i].set_title(
+                    f"{lbl}\n{name}", fontsize=7, pad=3
+                )
+
+        for row, img_tensor in enumerate(sample_list):
+            model_acts = {lbl: _get_layer_acts(mdl, img_tensor)
+                          for lbl, mdl in model_items}
+
+            axes[row, 0].imshow(img_tensor[0, 0].numpy(), cmap="gray")
+            axes[row, 0].set_ylabel(f"sample {row + 1}", fontsize=7, rotation=0,
+                                    labelpad=42, va="center")
+            axes[row, 0].axis("off")
+
+            for m_idx, (lbl, _) in enumerate(model_items):
+                acts = model_acts[lbl]
+                for i, name in enumerate(VIS_LAYER_NAMES):
+                    sheet = _act_to_cortical_sheet(acts[name])
+                    axes[row, 1 + m_idx * n_lay + i].imshow(sheet, cmap="hot",
+                                                             vmin=0, vmax=1)
+                    axes[row, 1 + m_idx * n_lay + i].axis("off")
+
+        model_str = "  vs  ".join(lbl for lbl, _ in model_items)
+        plt.suptitle(
+            f"{cls_name}  —  {model_str}  |  Activation Cortical Sheets\n"
+            f"{n_rows} val samples  |  min-max normalised per cell  |  fc1 & fc2",
+            y=1.003, fontsize=9,
+        )
+        plt.tight_layout()
+        # Dividers drawn after tight_layout for accurate x positioning
+        for m_idx in range(1, n_models):
+            ax_r = axes[0, 1 + m_idx * n_lay - 1]
+            ax_l = axes[0, 1 + m_idx * n_lay]
+            x = (ax_r.get_position().x1 + ax_l.get_position().x0) / 2
+            fig.add_artist(plt.Line2D([x, x], [0.02, 0.93],
+                                       transform=fig.transFigure,
+                                       color="steelblue", linestyle="--", linewidth=1.2,
+                                       clip_on=False))
+        safe_name = cls_name.lower().replace("-", "_").replace(" ", "_")
+        path = out_dir / f"activation_per_category_{safe_name}.png"
+        fig.savefig(path, bbox_inches="tight", dpi=150)
+        plt.close(fig)
+        print(f"    {cls_name} -> {path}")
+
+
+def save_ssim_comparison_matrices(
+    models: dict,
+    val_loader: DataLoader,
+    out_dir: Path,
+    device: str,
+    n_samples: int = 15,
+) -> None:
+    """Pairwise mean-SSIM matrix over fc1 cortical-sheet activations.
+
+    Each cell (i, j) is the mean SSIM computed over all n_samples × n_samples
+    pairs drawn from class i and class j.  Three heatmaps (one per model) are
+    plotted side-by-side with class name text labels on the axes.
+
+    Summary metric — separation index (Cohen's-d analogue):
+        separation = (mean_intra − mean_inter) / std(all_cells)
+    This measures how many standard deviations the diagonal (same-class SSIM)
+    sits above the off-diagonal mean, normalised by the global spread of the
+    matrix.  A value near 0 means no discrimination; large positive values
+    indicate that same-class activations are markedly more similar than
+    cross-class ones.  Unlike intra/inter ratio it is scale-invariant and
+    comparable across models regardless of the absolute SSIM range.
+
+    Saved to:
+        out_dir/ssim_matrix.png
+        out_dir/ssim_scores.txt
+    """
+    from torchmetrics.functional.image import structural_similarity_index_measure as _torch_ssim
+
+    def _ssim_cell(sheets_i: np.ndarray, sheets_j: np.ndarray) -> float:
+        """Mean SSIM over all len(i) x len(j) pairs, computed in one batch.
+
+        sheets_i, sheets_j : (n, H, W) float32 in [0, 1]
+        Expands into (n*m, 1, H, W) preds and targets and calls torchmetrics
+        SSIM with reduction='elementwise_mean'.
+        """
+        n, m = len(sheets_i), len(sheets_j)
+        a = np.repeat(sheets_i, m, axis=0)            # (n*m, H, W)
+        b = np.tile(sheets_j,   (n, 1, 1))             # (n*m, H, W)
+        ta = torch.from_numpy(a).float().unsqueeze(1)  # (n*m, 1, H, W)
+        tb = torch.from_numpy(b).float().unsqueeze(1)
+        with torch.no_grad():
+            val = _torch_ssim(ta, tb, data_range=1.0, reduction="elementwise_mean")
+        return float(val)
+
+    n_classes   = len(FMNIST_CLASSES)
+    model_items = list(models.items())
+    n_models    = len(model_items)
+
+    print("  Collecting samples for SSIM comparison matrices ...")
+
+    # --- collect n_samples images per class ----------------------------------
+    samples: dict = {cls: [] for cls in range(n_classes)}
+    for imgs, lbls in val_loader:
+        for cls in range(n_classes):
+            need = n_samples - len(samples[cls])
+            if need > 0:
+                idx = (lbls == cls).nonzero(as_tuple=True)[0][:need]
+                for i in idx:
+                    samples[cls].append(imgs[i : i + 1])
+        if all(len(v) >= n_samples for v in samples.values()):
+            break
+
+    # --- helper: extract fc1 cortical sheets for a list of images ------------
+    def _get_sheets(model: SimpleNN, img_list: list) -> np.ndarray:
+        """Returns (n, H, W) array of min-max normalised fc1 cortical sheets."""
+        captured = [None]
+        handle = model.fc1.register_forward_hook(
+            lambda _m, _i, out: captured.__setitem__(0, out.detach().cpu())
+        )
+        model.eval()
+        out_sheets = []
+        with torch.no_grad():
+            for img in img_list:
+                captured[0] = None
+                model(img.to(device))
+                out_sheets.append(_act_to_cortical_sheet(captured[0][0]))
+        handle.remove()
+        return np.stack(out_sheets)   # (n, H, W)
+
+    # --- compute all cortical sheets per model/class -------------------------
+    all_sheets: dict = {}
+    for lbl, mdl in model_items:
+        print(f"    fc1 sheets for '{lbl}' ...")
+        all_sheets[lbl] = {
+            cls: _get_sheets(mdl, samples[cls]) for cls in range(n_classes)
+        }
+
+    # --- build SSIM matrices -------------------------------------------------
+    matrices: dict = {}
+    scores:   dict = {}
+    for lbl, _ in model_items:
+        print(f"    SSIM matrix for '{lbl}' ({n_samples}×{n_samples} pairs/cell) ...")
+        mat = np.zeros((n_classes, n_classes))
+        sh  = all_sheets[lbl]
+        for i in range(n_classes):
+            for j in range(n_classes):
+                mat[i, j] = _ssim_cell(sh[i], sh[j])
+        matrices[lbl] = mat
+
+        # --- separation index ------------------------------------------------
+        # mean_intra: mean of the 10 diagonal cells (same-class SSIM)
+        # mean_inter: mean of the 90 off-diagonal cells (cross-class SSIM)
+        # std_all:    std of all 100 cells — global spread of the matrix
+        # separation = (mean_intra - mean_inter) / std_all
+        #   ~ how many std deviations the diagonal rises above the cross-class mean
+        #   0 → no discrimination; higher → tighter within-class clustering
+        mask_diag     = np.eye(n_classes, dtype=bool)
+        mean_intra    = mat[mask_diag].mean()
+        mean_inter    = mat[~mask_diag].mean()
+        std_all       = mat.std()
+        separation    = (mean_intra - mean_inter) / (std_all + 1e-12)
+        scores[lbl]   = {
+            "intra":      mean_intra,
+            "inter":      mean_inter,
+            "std_all":    std_all,
+            "separation": separation,
+        }
+        print(f"      intra={mean_intra:.4f}  inter={mean_inter:.4f}  "
+              f"std={std_all:.4f}  separation={separation:.3f}")
+
+    # --- figure: 1 row × n_models panels -------------------------------------
+    CELL    = 1.8
+    fig_w   = n_models * (n_classes * CELL + 1.2) + 0.5
+    fig_h   = n_classes * CELL + 2.8   # room for rotated x labels + title
+
+    fig, axes = plt.subplots(1, n_models,
+                             figsize=(fig_w, fig_h),
+                             squeeze=False)
+    axes = axes[0]
+
+    # Shared colour scale
+    vmin = min(m.min() for m in matrices.values())
+    vmax = max(m.max() for m in matrices.values())
+
+    for ax_idx, (lbl, _) in enumerate(model_items):
+        ax  = axes[ax_idx]
+        mat = matrices[lbl]
+        sc  = scores[lbl]
+
+        im = ax.imshow(mat, cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, format="%.2f")
+        cbar.ax.tick_params(labelsize=7)
+
+        # Cell value annotations
+        mid = (vmin + vmax) / 2
+        for i in range(n_classes):
+            for j in range(n_classes):
+                color = "white" if mat[i, j] < mid else "black"
+                ax.text(j, i, f"{mat[i, j]:.2f}",
+                        ha="center", va="center", fontsize=5, color=color)
+
+        # Highlight the diagonal
+        for k in range(n_classes):
+            ax.add_patch(
+                plt.Rectangle((k - 0.5, k - 0.5), 1, 1,
+                               fill=False, edgecolor="cyan", linewidth=1.2)
+            )
+
+        # Class name tick labels
+        ax.set_xticks(range(n_classes))
+        ax.set_yticks(range(n_classes))
+        ax.set_xticklabels(FMNIST_CLASSES, rotation=45, ha="right", fontsize=7)
+        ax.set_yticklabels(FMNIST_CLASSES, fontsize=7)
+        ax.tick_params(length=0)
+
+        ax.set_title(
+            f"{lbl}\n"
+            f"intra = {sc['intra']:.4f}   inter = {sc['inter']:.4f}\n"
+            f"separation = {sc['separation']:.3f}",
+            fontsize=9, pad=6,
+        )
+
+    plt.suptitle(
+        "Pairwise Mean SSIM of fc1 Cortical-Sheet Activations\n"
+        f"({n_samples} samples/class  →  {n_samples * n_samples} pairs per cell  "
+        "·  diagonal = intra-class,  off-diagonal = inter-class)\n"
+        "separation = (mean_intra − mean_inter) / std(all cells)",
+        fontsize=10, y=1.01,
+    )
+    plt.tight_layout()
+    path = out_dir / "ssim_matrix.png"
+    fig.savefig(path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    print(f"  Saved SSIM matrix -> {path}")
+
+    # --- save scores to text file --------------------------------------------
+    scores_path = out_dir / "ssim_scores.txt"
+    with open(scores_path, "w") as f:
+        f.write("SSIM Clustering Scores\n")
+        f.write(f"n_samples per class : {n_samples}\n")
+        f.write(f"pairs per cell      : {n_samples * n_samples}\n")
+        f.write(f"n_classes           : {n_classes}\n")
+        f.write("\n")
+        f.write(
+            "Separation index = (mean_intra - mean_inter) / std(all_cells)\n"
+            "  Measures how many std deviations the diagonal (same-class SSIM)\n"
+            "  sits above the off-diagonal mean, relative to the global spread\n"
+            "  of the matrix.  0 = no discrimination; higher = better clustering.\n"
+            "  Note: diagonal cells include self-pairs (SSIM=1) which inflate intra.\n"
+        )
+        f.write("\n")
+        col_w = 14
+        header = (f"{'Model':<{col_w}}  {'Intra':>8}  {'Inter':>8}  "
+                  f"{'Std':>8}  {'Separation':>12}\n")
+        f.write(header)
+        f.write("-" * len(header.rstrip()) + "\n")
+        for lbl, sc in scores.items():
+            f.write(
+                f"{lbl:<{col_w}}  {sc['intra']:>8.4f}  {sc['inter']:>8.4f}  "
+                f"{sc['std_all']:>8.4f}  {sc['separation']:>12.3f}\n"
+            )
+    print(f"  Saved SSIM scores  -> {scores_path}")
+
+    # Print summary table to stdout
+    print("\n  SSIM Clustering Scores:")
+    print(f"  {'Model':<14}  {'Intra':>8}  {'Inter':>8}  {'Std':>8}  {'Separation':>12}")
+    print(f"  {'-'*14}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*12}")
+    for lbl, sc in scores.items():
+        print(f"  {lbl:<14}  {sc['intra']:>8.4f}  {sc['inter']:>8.4f}  "
+              f"{sc['std_all']:>8.4f}  {sc['separation']:>12.3f}")
 
 
 def save_comparison_figure(models: dict,
@@ -573,13 +906,6 @@ def save_comparison_figure(models: dict,
     for col, lbl in enumerate(col_labels):
         axes[0, col].set_title(lbl, fontsize=9, pad=3)
 
-    # Dividers between model groups
-    for m_idx in range(1, n_models):
-        div_x = (1 + m_idx * n_cl) / n_cols
-        fig.add_artist(plt.Line2D([div_x, div_x], [0, 1],
-                                  transform=fig.transFigure,
-                                  color="gray", linestyle="--", linewidth=1))
-
     example_imgs = {}
     for imgs, lbls in val_loader:
         for cls in range(n_classes):
@@ -615,10 +941,114 @@ def save_comparison_figure(models: dict,
     plt.suptitle(f"{model_str} — Category Selectivity (fc1 & fc2)",
                  y=1.002, fontsize=11)
     plt.tight_layout()
+    for m_idx in range(1, n_models):
+        ax_r = axes[0, 1 + m_idx * n_cl - 1]
+        ax_l = axes[0, 1 + m_idx * n_cl]
+        x = (ax_r.get_position().x1 + ax_l.get_position().x0) / 2
+        fig.add_artist(plt.Line2D([x, x], [0.02, 0.93],
+                                   transform=fig.transFigure,
+                                   color="gray", linestyle="--", linewidth=1,
+                                   clip_on=False))
     path = out_dir / "selectivity_comparison.png"
     fig.savefig(path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     print(f"  Saved comparison -> {path}")
+
+
+def save_subset_comparison_figure(
+    models: dict,
+    val_loader: DataLoader,
+    out_dir: Path,
+    device: str,
+    class_indices: list,
+    tag: str,
+    subtitle: str = "",
+) -> None:
+    """Topo vs topo-only selectivity comparison for a subset of classes.
+
+    Parameters
+    ----------
+    models        : dict mapping label -> SimpleNN (typically just topo + topo-only)
+    class_indices : list of FMNIST_CLASSES indices to show as rows
+    tag           : filename suffix, e.g. "tops" -> selectivity_subset_tops.png
+    subtitle      : optional human-readable description for the suptitle
+    """
+    compare_layers = ["fc1", "fc2"]
+    model_items    = list(models.items())
+
+    print(f"  Collecting activations for subset comparison '{tag}' ...")
+    all_acts_dict = {}
+    all_labels    = None
+    for lbl, mdl in model_items:
+        acts, lbls = _collect_activations(mdl, val_loader, device)
+        all_acts_dict[lbl] = acts
+        if all_labels is None:
+            all_labels = lbls
+
+    n_rows  = len(class_indices)
+    n_cl    = len(compare_layers)
+    n_models = len(model_items)
+    col_labels = (["Example"]
+                  + [f"{lbl}/{n}" for lbl, _ in model_items for n in compare_layers])
+    n_cols = len(col_labels)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(n_cols * 2.5, n_rows * 2.5),
+        gridspec_kw={"width_ratios": [1] + [2] * (n_cols - 1)},
+        squeeze=False,
+    )
+    for col, lbl in enumerate(col_labels):
+        axes[0, col].set_title(lbl, fontsize=9, pad=3)
+
+    # collect one example image per requested class
+    example_imgs = {}
+    for imgs, lbls in val_loader:
+        for cls in class_indices:
+            if cls not in example_imgs:
+                idx = (lbls == cls).nonzero(as_tuple=True)[0]
+                if len(idx):
+                    example_imgs[cls] = imgs[idx[0]].squeeze().numpy()
+        if len(example_imgs) == len(class_indices):
+            break
+
+    for row, cls in enumerate(class_indices):
+        axes[row, 0].imshow(example_imgs.get(cls, np.zeros((28, 28))), cmap="gray")
+        axes[row, 0].set_ylabel(FMNIST_CLASSES[cls], fontsize=8, rotation=0,
+                                labelpad=50, va="center")
+        axes[row, 0].axis("off")
+
+        col = 1
+        for lbl, _ in model_items:
+            for name in compare_layers:
+                a    = all_acts_dict[lbl][name]
+                N    = a.shape[1]
+                size = find_cortical_sheet_size(N)
+                tv   = _t_values(a, all_labels, cls)
+                tmap = tv[:size.height * size.width].reshape(size.height, size.width).numpy()
+                vmax = max(abs(tmap.min()), abs(tmap.max()), 0.1)
+                ax   = axes[row, col]
+                im   = ax.imshow(tmap, cmap="RdGy_r", vmin=-vmax, vmax=vmax)
+                ax.axis("off")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, format="%.1f")
+                col += 1
+
+    model_str = "  vs  ".join(lbl for lbl, _ in model_items)
+    title = f"{model_str} — Selectivity: {subtitle or tag}  (fc1 & fc2)"
+    plt.suptitle(title, y=1.002, fontsize=11)
+    plt.tight_layout()
+    for m_idx in range(1, n_models):
+        ax_r = axes[0, 1 + m_idx * n_cl - 1]
+        ax_l = axes[0, 1 + m_idx * n_cl]
+        x = (ax_r.get_position().x1 + ax_l.get_position().x0) / 2
+        fig.add_artist(plt.Line2D([x, x], [0.02, 0.93],
+                                   transform=fig.transFigure,
+                                   color="gray", linestyle="--", linewidth=1,
+                                   clip_on=False))
+    path = out_dir / f"selectivity_subset_{tag}.png"
+    fig.savefig(path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    print(f"  Saved subset comparison '{tag}' -> {path}")
 
 
 # -- Config loading ------------------------------------------------------------
@@ -887,7 +1317,13 @@ def train(cfg: dict):
         print(f"    {lname}: {json.dumps(lvals)}")
     print()
 
-    device   = cfg["device"] if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = cfg["device"]
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
     out_dir  = Path(cfg["output_dir"])
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -898,10 +1334,11 @@ def train(cfg: dict):
     ])
     train_ds = datasets.FashionMNIST(cfg["data_dir"], train=True,  download=True, transform=transform)
     val_ds   = datasets.FashionMNIST(cfg["data_dir"], train=False, download=True, transform=transform)
+    _pin = device.startswith("cuda")
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
-                              num_workers=4, pin_memory=True)
+                              num_workers=0, pin_memory=_pin)
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False,
-                              num_workers=4, pin_memory=True)
+                              num_workers=0, pin_memory=_pin)
     print(f"Dataset: {len(train_ds):,} train | {len(val_ds):,} val | 10 classes\n")
 
     layer_cfg = cfg["layers"]  # shorthand
@@ -993,28 +1430,49 @@ def train(cfg: dict):
         start_epoch=base_start, best_acc=base_best,
     )
 
-    # ── Visualisations ───────────────────────────────────────────────────────
-    all_models = {
-        "topo":      topo_model,
-        "topo-only": topo_only_model,
-        "baseline":  base_model,
-    }
-    print("\n" + "=" * 65)
-    print("  Generating selectivity maps ...")
-    print("=" * 65)
-    for lbl, mdl in all_models.items():
-        save_selectivity_maps(mdl, val_loader, out_dir, device, tag=lbl)
-    save_comparison_figure(all_models, val_loader, out_dir, device)
-    save_activation_cortical_sheets(all_models, val_loader, out_dir, device)
-    save_debug_cortical_sheets(
-        all_models, val_loader,
-        layer_cfg=layer_cfg,
-        out_dir=out_dir, device=device,
-    )
-
-    print(f"\nAll outputs in: {out_dir}")
+    print(f"\nTraining complete.  Checkpoints saved to: {ckpt_dir}")
+    print("  Run  examples/test/test_topo_sparsity.py  to generate evaluation figures.")
 
 
 if __name__ == "__main__":
     cfg = get_config()
-    train(cfg)
+
+    # Ensure logs directory exists and tee stdout/stderr to file + console
+    log_dir = BASE_DIR / "outputs" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"train_topo_sparsity-{ts}.txt"
+
+    class _Tee:
+        def __init__(self, *streams):
+            self._streams = streams
+        def write(self, data):
+            for s in self._streams:
+                try:
+                    s.write(data)
+                except Exception:
+                    pass
+        def flush(self):
+            for s in self._streams:
+                try:
+                    s.flush()
+                except Exception:
+                    pass
+        def isatty(self):
+            for s in self._streams:
+                if hasattr(s, "isatty") and s.isatty():
+                    return True
+            return False
+
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    with open(log_path, "w") as fh:
+        sys.stdout = _Tee(orig_stdout, fh)
+        sys.stderr = _Tee(orig_stderr, fh)
+        try:
+            train(cfg)
+        finally:
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
+
+    print(f"Saved run log -> {log_path}")

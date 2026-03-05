@@ -86,7 +86,7 @@ OVERRIDE_ARGS=""
 [[ -n "$RESUME_TOPO_ONLY" ]] && OVERRIDE_ARGS+=" --resume-topo-only ${RESUME_TOPO_ONLY}"
 [[ -n "$RESUME_BASE"    ]] && OVERRIDE_ARGS+=" --resume-base ${RESUME_BASE}"
 
-srun python -u src/train/train_topo_sparsity.py \
+srun python -u examples/train/train_topo_sparsity.py \
     --config "${CONFIG_FILE}" \
     ${OVERRIDE_ARGS}
 
