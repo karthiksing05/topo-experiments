@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Config for train_topo_group_lasso.py — four model variants are trained:",
+    "  topo_gl     : TopoLoss + Group-Lasso (lambda_gl controls strength)",
+    "  topo_kl_ent : TopoLoss + KL-from-uniform + per-instance entropy",
+    "  topo_only   : TopoLoss only (all sparsity lambdas zeroed automatically)",
+    "  baseline    : Cross-entropy only",
+    "",
+    "Group-lasso penalty: sum over spatial patches of mean_batch(||act_patch||_2).",
+    "Patches are defined by the same factor_h/factor_w downsampling grid used",
+    "for the KL/entropy penalties.",
+    "",
+    "Top-level keys can be overridden via CLI (e.g. --epochs 30 --device cuda:1).",
+    "null paths resolve to project-root defaults at runtime.",
+    "Per-layer keys must be edited here; they cannot be set from the command line.",
+    "",
+    "lambda_gl      : group-lasso weight (used only for topo_gl variant).",
+    "lambda_kl      : KL-divergence weight (used only for topo_kl_ent variant).",
+    "lambda_entropy : entropy penalty weight (used only for topo_kl_ent variant).",
+    "temperature    : softmax temperature for KL/entropy computation.",
+    "Only fc1 receives TopoLoss + sparsity penalties; fc2 is left unconstrained."
+  ],
+
+  "data_dir":           null,
+  "output_dir":         null,
+  "hidden_size":        256,
+  "epochs":             20,
+  "batch_size":         128,
+  "lr":                 0.0005,
+  "device":             "cuda:0",
+  "print_freq":         5,
+
+  "resume_topo_gl":     null,
+  "resume_topo_kl_ent": null,
+  "resume_topo_only":   null,
+  "resume_base":        null,
+
+  "layers": {
+    "fc1": {
+      "topo_scale":    10.0,
+      "factor_h":       4.0,
+      "factor_w":       4.0,
+      "lambda_gl":      2.0,
+      "lambda_kl":      1.0,
+      "lambda_entropy": 2.0,
+      "temperature":    1.0
+    }
+  }
+}
