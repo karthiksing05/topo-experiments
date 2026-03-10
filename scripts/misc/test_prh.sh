@@ -50,7 +50,7 @@ mkdir -p "${HF_CACHE_DIR}"
 mkdir -p outputs/test_prh
 
 echo ""
-srun python -u examples/test/test_prh.py
+srun python -u src/test/test_prh.py
 echo ""
 
 echo "=========================================="

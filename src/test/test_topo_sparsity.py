@@ -10,9 +10,9 @@ generates all visualisation figures under outputs/train_topo_sparsity/:
 
 Usage
 -----
-python examples/test/test_topo_sparsity.py
-python examples/test/test_topo_sparsity.py --config configs/train_topo_sparsity.json
-python examples/test/test_topo_sparsity.py \\
+python src/test/test_topo_sparsity.py
+python src/test/test_topo_sparsity.py --config configs/train_topo_sparsity.json
+python src/test/test_topo_sparsity.py \\
     --checkpoint-topo      outputs/train_topo_sparsity/checkpoints/best_topo.pt \\
     --checkpoint-topo-only outputs/train_topo_sparsity/checkpoints/best_topo_only.pt \\
     --checkpoint-base      outputs/train_topo_sparsity/checkpoints/best_baseline.pt
@@ -205,7 +205,7 @@ def evaluate(cfg: dict) -> None:
             return candidate
         raise FileNotFoundError(
             f"Checkpoint not found: {candidate}.\n"
-            f"Train the model first (examples/train/train_topo_sparsity.py) or "
+            f"Train the model first (src/train/train_topo_sparsity.py) or "
             f"supply --{cfg_key.replace('_', '-')}."
         )
 

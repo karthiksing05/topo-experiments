@@ -1,0 +1,43 @@
+{
+    "_comment": "dense_seeds: many small seeds (6x6=36 / 5x5=25) with aggressive expansion. The sheet starts finely subdivided and each patch grows quickly. Tests fine-grained topographic organisation vs the base 4x4/3x3 setup.",
+
+    "training": {
+        "epochs": 20,
+        "batch_size": 64,
+        "lr": 0.001,
+        "lambda_cross": 0.01
+    },
+
+    "layer1": {
+        "in_features": 784,
+        "out_features": 256,
+        "grid_size": 6,
+        "warmup_steps": 100,
+        "expansion_threshold": 0.08,
+        "death_threshold": 0.02,
+        "death_sustained_steps": 150,
+        "expansion_radius": 1,
+        "residual_weight": 0.65,
+        "beta": 0.75,
+        "lambda_intra": 0.1
+    },
+
+    "layer2": {
+        "in_features": 256,
+        "out_features": 128,
+        "grid_size": 5,
+        "warmup_steps": 150,
+        "expansion_threshold": 0.08,
+        "death_threshold": 0.02,
+        "death_sustained_steps": 200,
+        "expansion_radius": 1,
+        "residual_weight": 0.65,
+        "beta": 0.75,
+        "lambda_intra": 0.1
+    },
+
+    "viz": {
+        "viz_every": 5,
+        "viz_dir": "outputs/toposeed/viz_mlp_dense_seeds"
+    }
+}

@@ -16,12 +16,13 @@ Training schedule follows the original He et al. (2015) ResNet paper:
 
 Usage
 -----
-python examples/train/train_resnet_imagenet.py
-python examples/train/train_resnet_imagenet.py --config configs/train_resnet_imagenet.json
-python examples/train/train_resnet_imagenet.py --epochs 90 --device cuda:0 --data-dir /data/imagenet
+python src/train/train_resnet_imagenet.py
+python src/train/train_resnet_imagenet.py --config configs/train_resnet_imagenet.json
+python src/train/train_resnet_imagenet.py --epochs 90 --device cuda:0 --data-dir /data/imagenet
 
-The ImageNet root should contain ``train/`` and ``val/`` sub-directories in the
-standard ImageFolder layout (one sub-folder per synset / class label).
+ImageNet-1k is loaded directly from the Hugging Face Hub (``ILSVRC/imagenet-1k``).
+A valid HF access token must be available via ``--hf-token``, the ``HF_TOKEN``
+environment variable, or a cached ``huggingface-cli login``.
 """
 
 from __future__ import annotations
@@ -43,10 +44,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torchvision.datasets as datasets
 import torchvision.models as tv_models
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from topoloss import LaplacianPyramid, TopoLoss
 from topoloss.core import find_cortical_sheet_size
@@ -65,122 +65,56 @@ BASE_DIR   = Path(__file__).resolve().parents[2]
 OUTPUT_DIR = BASE_DIR / "outputs" / "train_resnet_imagenet"
 
 # ---------------------------------------------------------------------------
-# ImageNet-1k auto-download from Hugging Face Hub
+# HuggingFace ImageNet-1k dataset wrapper
 # ---------------------------------------------------------------------------
 
-def _dir_has_images(d: Path) -> bool:
-    """True if *d* exists and contains at least one JPEG/PNG image file."""
-    if not d.is_dir():
-        return False
-    for ext in ("*.JPEG", "*.jpeg", "*.jpg", "*.JPG", "*.png", "*.PNG"):
-        if next(d.rglob(ext), None) is not None:
-            return True
-    return False
-
-
-def maybe_download_imagenet(data_dir: Path, hf_token: str | None = None) -> None:
-    """Download ImageNet-1k from Hugging Face Hub and write it as an ImageFolder tree.
-
-    Only runs when *data_dir/train* or *data_dir/val* are absent / empty.
-    The gated dataset ``ILSVRC/imagenet-1k`` on the Hugging Face Hub requires that you:
-      1. Accept the terms at https://huggingface.co/datasets/ILSVRC/imagenet-1k
-      2. Pass your HF access token via *hf_token* (or set the ``HF_TOKEN``
-         environment variable, or run ``huggingface-cli login`` beforehand).
-
-    Layout written to disk::
-
-        <data_dir>/
-          train/<label_id: zero-padded 4-digit int>/<idx>.JPEG
-          val/<label_id: zero-padded 4-digit int>/<idx>.JPEG
+class HFImageNetDataset(Dataset):
+    """Thin ``torch.utils.data.Dataset`` wrapper around ``ILSVRC/imagenet-1k``
+    loaded directly from the Hugging Face Hub (no local copy needed).
 
     Parameters
     ----------
-    data_dir : root directory that will contain ``train/`` and ``val/``.
-    hf_token : Hugging Face access token.  ``None`` falls back to the
-               ``HF_TOKEN`` environment variable or a cached login.
+    split     : ``"train"`` or ``"validation"``.
+    transform : torchvision transform applied to each PIL image.
+    token     : HF access token.  ``None`` falls back to the ``HF_TOKEN``
+                environment variable or a cached ``huggingface-cli`` login.
     """
-    import os
 
-    train_dir = data_dir / "train"
-    val_dir   = data_dir / "val"
-
-    need_train = not _dir_has_images(train_dir)
-    need_val   = not _dir_has_images(val_dir)
-
-    if not need_train and not need_val:
-        return   # data already present
-
-    if not _HF_DATASETS_AVAILABLE:
-        raise ImportError(
-            "The 'datasets' package is required for automatic ImageNet download.\n"
-            "Install it with:  pip install datasets"
-        )
-
-    token = hf_token or os.environ.get("HF_TOKEN") or True  # True = cached creds
-
-    print("\n" + "=" * 70)
-    print("  IMAGENET-1k AUTO-DOWNLOAD")
-    print("=" * 70)
-    print("  Source  : huggingface.co/datasets/ILSVRC/imagenet-1k")
-    print(f"  Target  : {data_dir}")
-    print("  WARNING : Full ImageNet-1k is ~155 GB compressed.")
-    print("            Make sure you have enough disk space and have accepted")
-    print("            the dataset terms on Hugging Face Hub.")
-    print()
-
-    splits_needed: list[tuple[str, Path]] = []
-    if need_train:
-        splits_needed.append(("train", train_dir))
-    if need_val:
-        splits_needed.append(("validation", val_dir))  # HF uses 'validation'
-
-    for hf_split, out_dir in splits_needed:
-        print(f"  Downloading split '{hf_split}' -> {out_dir} ...")
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ds = hf_datasets.load_dataset(
+    def __init__(self,
+                 split: str,
+                 transform,
+                 token: str | None = None) -> None:
+        if not _HF_DATASETS_AVAILABLE:
+            raise ImportError(
+                "The 'datasets' package is required.\n"
+                "Install it with:  pip install datasets"
+            )
+        import os
+        _token = token or os.environ.get("HF_TOKEN") or True
+        print(f"  Loading ILSVRC/imagenet-1k split='{split}' from HuggingFace Hub ...")
+        self._ds = hf_datasets.load_dataset(
             "ILSVRC/imagenet-1k",
-            split=hf_split,
-            token=token,
+            split=split,
+            token=_token,
             trust_remote_code=True,
         )
+        self._transform = transform
+        print(f"  Loaded {len(self._ds):,} examples.")
 
-        n_total   = len(ds)
-        n_written = 0
-        n_skipped = 0
-        t_start   = time.time()
+    def __len__(self) -> int:
+        return len(self._ds)
 
-        for idx, example in enumerate(ds):
-            label    = example["label"]                      # int 0-999
-            cls_dir  = out_dir / f"{label:04d}"
-            cls_dir.mkdir(exist_ok=True)
-            img_path = cls_dir / f"{idx:07d}.JPEG"
+    def __getitem__(self, idx: int):
+        example = self._ds[idx]
+        img     = example["image"]
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        if self._transform is not None:
+            img = self._transform(img)
+        return img, example["label"]
 
-            if img_path.exists():                            # resume support
-                n_skipped += 1
-            else:
-                img = example["image"]
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                img.save(img_path, format="JPEG", quality=95)
-                n_written += 1
 
-            if (idx + 1) % 10_000 == 0 or (idx + 1) == n_total:
-                elapsed = time.time() - t_start
-                pct     = 100 * (idx + 1) / n_total
-                rate    = (n_written + n_skipped) / max(elapsed, 1e-3)
-                eta     = (n_total - idx - 1) / max(rate, 1e-3)
-                print(
-                    f"    [{hf_split}] {idx+1:>7}/{n_total}  "
-                    f"({pct:5.1f}%)  "
-                    f"written={n_written}  skipped={n_skipped}  "
-                    f"rate={rate:.0f} img/s  ETA={eta/60:.1f} min"
-                )
 
-        print(f"  Split '{hf_split}' done — {n_written} written, {n_skipped} skipped.\n")
-
-    print("  ImageNet-1k download complete.")
-    print("=" * 70 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -612,45 +546,29 @@ def train(cfg: dict) -> None:
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Data loading (auto-download if needed) ----------------------------
-    data_dir  = Path(cfg["data_dir"])
-    train_dir = data_dir / "train"
-    val_dir   = data_dir / "val"
+    # ---- Data loading from HuggingFace Hub (ILSVRC/imagenet-1k) -----------
+    hf_token = cfg.get("hf_token")
 
-    if not _dir_has_images(train_dir) or not _dir_has_images(val_dir):
-        print(f"ImageNet not found at {data_dir} — attempting auto-download ...")
-        maybe_download_imagenet(data_dir, hf_token=cfg.get("hf_token"))
+    # Standard ImageNet preprocessing (matches torchvision ResNet recipe)
+    _MEAN = [0.485, 0.456, 0.406]
+    _STD  = [0.229, 0.224, 0.225]
 
-    # Verify again after attempted download
-    if not _dir_has_images(train_dir) or not _dir_has_images(val_dir):
-        raise FileNotFoundError(
-            f"ImageNet train/val directories still empty after download attempt.\n"
-            f"Expected layout:\n"
-            f"  {train_dir}/<label>/*.JPEG\n"
-            f"  {val_dir}/<label>/*.JPEG\n"
-            "If this is a gated dataset, make sure you have:\n"
-            "  1. Accepted terms at https://huggingface.co/datasets/ILSVRC/imagenet-1k\n"
-            "  2. Provided a valid token via --hf-token or the HF_TOKEN env var."
-        )
-
-    # Standard ImageNet augmentation (He et al. 2015 / torchvision convention)
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=_MEAN, std=_STD),
     ])
     val_transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=_MEAN, std=_STD),
     ])
 
-    train_ds = datasets.ImageFolder(str(train_dir), transform=train_transform)
-    val_ds   = datasets.ImageFolder(str(val_dir),   transform=val_transform)
+    print("Loading datasets from HuggingFace Hub (ILSVRC/imagenet-1k) ...")
+    train_ds = HFImageNetDataset(split="train",      transform=train_transform, token=hf_token)
+    val_ds   = HFImageNetDataset(split="validation", transform=val_transform,   token=hf_token)
 
     _pin = str(device).startswith("cuda")
     train_loader = DataLoader(
@@ -671,7 +589,7 @@ def train(cfg: dict) -> None:
     incl_down       = cfg["include_downsample"]
 
     def _make_model() -> nn.Module:
-        """Create a fresh ResNet-18 adapted for num_classes."""
+        """Create a fresh ResNet-18 with random initialisation."""
         m = tv_models.resnet18(weights=None, num_classes=cfg["num_classes"])
         return m.to(device)
 

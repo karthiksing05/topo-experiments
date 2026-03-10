@@ -17,6 +17,7 @@ from .utils import (
 from .visualize import (
     plot_cortical_sheet_weights,
     plot_active_mask,
+    plot_activation_map,
     plot_selectivity_maps,
     plot_multi_layer_selectivity,
     plot_all,
@@ -38,6 +39,7 @@ __all__ = [
     "get_device",
     "plot_cortical_sheet_weights",
     "plot_active_mask",
+    "plot_activation_map",
     "plot_selectivity_maps",
     "plot_multi_layer_selectivity",
     "plot_all",

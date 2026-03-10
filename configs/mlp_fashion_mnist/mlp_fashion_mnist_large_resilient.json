@@ -1,0 +1,43 @@
+{
+    "_comment": "large_resilient: bigger layers (512/256 neurons), more seeds (grid 6/4), neurons are hard to kill (high death_sustained_steps + low death_threshold). Tests whether more capacity + resilience produces richer topographic maps.",
+
+    "training": {
+        "epochs": 20,
+        "batch_size": 64,
+        "lr": 0.001,
+        "lambda_cross": 0.01
+    },
+
+    "layer1": {
+        "in_features": 784,
+        "out_features": 512,
+        "grid_size": 6,
+        "warmup_steps": 200,
+        "expansion_threshold": 0.12,
+        "death_threshold": 0.008,
+        "death_sustained_steps": 400,
+        "expansion_radius": 1,
+        "residual_weight": 0.5,
+        "beta": 0.7,
+        "lambda_intra": 0.1
+    },
+
+    "layer2": {
+        "in_features": 512,
+        "out_features": 256,
+        "grid_size": 4,
+        "warmup_steps": 300,
+        "expansion_threshold": 0.12,
+        "death_threshold": 0.008,
+        "death_sustained_steps": 500,
+        "expansion_radius": 1,
+        "residual_weight": 0.5,
+        "beta": 0.7,
+        "lambda_intra": 0.1
+    },
+
+    "viz": {
+        "viz_every": 5,
+        "viz_dir": "outputs/toposeed/viz_mlp_large_resilient"
+    }
+}

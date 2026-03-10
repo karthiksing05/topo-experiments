@@ -1,0 +1,23 @@
+{
+  "stl_epochs": 100,
+  "finetune_epochs": 30,
+  "lr": 1e-3,
+  "finetune_lr": 1e-4,
+  "batch_size": 128,
+  "img_size": 96,
+  "num_classes": 10,
+  "device": "cuda",
+  "num_workers": 8,
+  "include_downsample": false,
+  "lambda_topo": 10.0,
+  "default_layer_cfg": {
+    "topo_scale": 10.0,
+    "factor_h": 4.0,
+    "factor_w": 4.0,
+    "lambda_topo": 10.0,
+    "lambda_entropy": 1.0,
+    "lambda_kl": 0.2,
+    "lambda_sparse": 1.0
+  },
+  "layers": {}
+}

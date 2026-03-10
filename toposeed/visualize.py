@@ -17,9 +17,15 @@ plot_selectivity_maps(layer, dataloader, class_names, device, out_path, title=No
     Per-class selectivity maps on the cortical sheet.
     selectivity_c = mean_activation_class_c  −  mean_activation_other_classes
 
+plot_activation_map(layer, out_path, title=None)
+    Three-panel map showing, per neuron on the H×W sheet:
+      • mean |activation| from the last training batch
+      • gradient magnitude from the last backward pass
+      • evidence EMA (grad × act running average that drives expansion)
+
 plot_all(layer, layer_name, dataloader, class_names, device, out_dir,
          epoch=None, prefix="")
-    Convenience wrapper: calls all three functions above.
+    Convenience wrapper: calls all four functions above.
 
 plot_multi_layer_selectivity(topo_layers, layer_names, dataloader, class_names,
                               device, out_path, title=None, n_samples_per_class=200)
@@ -223,40 +229,56 @@ def plot_cortical_sheet_weights(
     n_cols = int(math.ceil(math.sqrt(n_slices)))
     n_rows_slices = int(math.ceil(n_slices / n_cols))
 
-    total_rows = 1 + n_rows_slices
-    fig = plt.figure(figsize=(max(8, n_cols * 2.2), total_rows * 2.5 + 0.6))
+    # Layout: slice grid on the left (n_cols columns), L2 heatmap on the right
+    # (one extra column).  The L2 column is sized so the square-pixel heatmap
+    # fills the full height of the slice grid.
+    cell_w, cell_h = 2.2, 2.5
+    slice_grid_h = n_rows_slices * cell_h
+    # L2 column width: at aspect="equal" the image will be W/H × height_in
+    l2_col_w = max(2.0, slice_grid_h * W / max(H, 1)) + 0.7  # +0.7 for colorbar
+    fig_w = n_cols * cell_w + l2_col_w
+    fig_h = slice_grid_h + 0.5   # 0.5 for suptitle
+
+    fig = plt.figure(figsize=(fig_w, fig_h), constrained_layout=False)
     fig.patch.set_facecolor("#1a1a2e")
 
-    gs = fig.add_gridspec(total_rows, n_cols, hspace=0.35, wspace=0.12)
+    # width_ratios: equal slice columns + one wider L2 column
+    width_ratios = [cell_w] * n_cols + [l2_col_w]
+    gs = fig.add_gridspec(
+        n_rows_slices, n_cols + 1,
+        width_ratios=width_ratios,
+        hspace=0.35, wspace=0.18,
+        left=0.01, right=0.99, top=0.93, bottom=0.01,
+    )
 
-    # L2-norm spans full top row
-    ax_l2 = fig.add_subplot(gs[0, :])
-    cmap_l2 = plt.cm.inferno.copy()
-    cmap_l2.set_bad("black")
-    im = ax_l2.imshow(l2, cmap=cmap_l2, aspect="auto", interpolation="nearest")
-    plt.colorbar(im, ax=ax_l2, fraction=0.02, pad=0.01)
-    _patch_boundary_overlay(ax_l2, patch_id.astype(int), active)
-    _mark_seeds(ax_l2, layer.sheet.seed_positions, active)
-    ax_l2.set_title("Weight L2-Norm per Neuron", color="white", fontsize=9)
-    ax_l2.axis("off")
-
-    # Input-feature slices
+    # Input-feature slices — left n_cols columns
     vabs = max(np.nanmax(np.abs(np.stack(slices))), 1e-8)
+    cmap_w = plt.cm.RdBu_r.copy()
+    cmap_w.set_bad("black")
     for idx, (d_idx, sl) in enumerate(zip(slice_indices, slices)):
-        row = 1 + idx // n_cols
+        row = idx // n_cols
         col = idx % n_cols
         ax = fig.add_subplot(gs[row, col])
         sl_masked = sl.copy()
         sl_masked[~active] = np.nan
-        cmap_w = plt.cm.RdBu_r.copy()
-        cmap_w.set_bad("black")
         ax.imshow(sl_masked, cmap=cmap_w, vmin=-vabs, vmax=vabs,
-                  aspect="auto", interpolation="nearest")
+                  aspect="equal", interpolation="nearest")
         ax.set_title(f"d={d_idx}", color="white", fontsize=6)
         ax.axis("off")
 
+    # L2-norm heatmap — rightmost column, spanning all rows
+    ax_l2 = fig.add_subplot(gs[:, -1])
+    cmap_l2 = plt.cm.inferno.copy()
+    cmap_l2.set_bad("black")
+    im = ax_l2.imshow(l2, cmap=cmap_l2, aspect="equal", interpolation="nearest")
+    plt.colorbar(im, ax=ax_l2, fraction=0.06, pad=0.03, shrink=0.6)
+    _patch_boundary_overlay(ax_l2, patch_id.astype(int), active)
+    _mark_seeds(ax_l2, layer.sheet.seed_positions, active)
+    ax_l2.set_title("Weight L2-Norm\nper Neuron", color="white", fontsize=8)
+    ax_l2.axis("off")
+
     suptitle = title or f"Cortical Sheet Weights  [{H}×{W}×{D}]"
-    fig.suptitle(suptitle, color="white", fontsize=11, y=1.01)
+    fig.suptitle(suptitle, color="white", fontsize=11, y=0.98)
 
     plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -312,6 +334,82 @@ def plot_active_mask(
         ax.legend(handles=handles, bbox_to_anchor=(1.01, 1), loc="upper left",
                   fontsize=5, framealpha=0.3, labelcolor="white",
                   facecolor="#1a1a2e")
+
+    plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def plot_activation_map(
+    layer: TopoSeedLayer,
+    out_path: str | Path,
+    title: Optional[str] = None,
+) -> None:
+    """
+    Three-panel activation diagnostic for one layer.
+
+    Panels (left → right):
+    1. **Mean |activation|** — `layer._last_activation` mapped onto H×W.
+       Shows which neurons fired strongly during the most recent training batch.
+    2. **Gradient magnitude** — `layer._last_grad_magnitude` mapped onto H×W.
+       Shows which neurons received the strongest learning signal.
+    3. **Evidence EMA** — `layer._evidence_buf.ema` (running EMA of
+       grad × act).  This is the signal the ExpansionManager uses to decide
+       when to expand a patch; bright regions are about to grow.
+
+    Dormant neurons are masked to black in all three panels.
+    Patch boundaries and seed positions are overlaid.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    H, W = layer.H, layer.W
+    active = _to_numpy(layer.sheet.active_mask).astype(bool)   # (H, W)
+    patch_id_np = _to_numpy(layer.sheet.patch_id.float()).astype(int)
+
+    def _masked(tensor_or_none) -> np.ndarray:
+        """Convert (H, W) tensor to numpy, NaN-masking dormant cells."""
+        if tensor_or_none is None:
+            return np.full((H, W), np.nan)
+        arr = _to_numpy(tensor_or_none)   # already (H, W) from layer hooks
+        out = arr.copy()
+        out[~active] = np.nan
+        return out
+
+    act_map  = _masked(layer._last_activation)
+    grad_map = _masked(layer._last_grad_magnitude)
+    # Evidence EMA lives in _evidence_buf.ema (H, W)
+    ema_map  = _to_numpy(layer._evidence_buf.ema).copy()
+    ema_map[~active] = np.nan
+
+    panels = [
+        (act_map,  plt.cm.hot,    "Mean |Activation|"),
+        (grad_map, plt.cm.plasma, "Gradient Magnitude"),
+        (ema_map,  plt.cm.viridis, "Evidence EMA\n(grad × act)"),
+    ]
+
+    cell = 2.8
+    fig, axes = plt.subplots(1, 3, figsize=(cell * 3 + 0.8, cell + 0.7),
+                              squeeze=True)
+    fig.patch.set_facecolor("#1a1a2e")
+
+    for ax, (data, cmap, label) in zip(axes, panels):
+        cmap = cmap.copy()
+        cmap.set_bad("black")
+        im = ax.imshow(data, cmap=cmap, aspect="equal", interpolation="nearest")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+        _patch_boundary_overlay(ax, patch_id_np, active)
+        _mark_seeds(ax, layer.sheet.seed_positions, active)
+        ax.set_title(label, color="white", fontsize=8)
+        ax.axis("off")
+
+    # Annotate active count
+    n_active = int(active.sum())
+    n_total  = layer.n_out
+    fig.text(0.5, 0.01, f"Active: {n_active}/{n_total}",
+             ha="center", color="white", fontsize=7)
+
+    suptitle = title or f"Activation Diagnostics [{H}\u00d7{W} sheet]"
+    fig.suptitle(suptitle, color="white", fontsize=10, y=1.01)
 
     plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -528,29 +626,57 @@ def plot_all(
     prefix: str = "",
 ) -> None:
     """
-    Save all three visualisation types for one layer.
+    Save all four visualisation types for one layer into typed subdirectories.
 
-    Files written to `out_dir`:
+    For epoch-wise periodic saves the files are written under:
+        {out_dir}/debug/epoch{epoch:03d}/weights/
+        {out_dir}/debug/epoch{epoch:03d}/masks/
+        {out_dir}/debug/epoch{epoch:03d}/selectivities/
+        {out_dir}/debug/epoch{epoch:03d}/activations/
+
+    For final saves (epoch=None) the files go to:
+        {out_dir}/weights/
+        {out_dir}/masks/
+        {out_dir}/selectivities/
+        {out_dir}/activations/
+
+    Files:
         {prefix}{layer_name}_weights[_ep{epoch}].png
         {prefix}{layer_name}_mask[_ep{epoch}].png
         {prefix}{layer_name}_selectivity[_ep{epoch}].png
+        {prefix}{layer_name}_activations[_ep{epoch}].png
     """
     out_dir = Path(out_dir)
     suffix = f"_ep{epoch:03d}" if epoch is not None else ""
 
+    if epoch is not None:
+        base = out_dir / "debug" / f"epoch{epoch:03d}"
+    else:
+        base = out_dir
+
+    weights_dir       = base / "weights"
+    masks_dir         = base / "masks"
+    selectivities_dir = base / "selectivities"
+    activations_dir   = base / "activations"
+
     plot_cortical_sheet_weights(
         layer,
-        out_dir / f"{prefix}{layer_name}_weights{suffix}.png",
+        weights_dir / f"{prefix}{layer_name}_weights{suffix}.png",
         title=f"{layer_name} — Cortical Sheet Weights" + (f" (ep {epoch})" if epoch else ""),
     )
     plot_active_mask(
         layer,
-        out_dir / f"{prefix}{layer_name}_mask{suffix}.png",
+        masks_dir / f"{prefix}{layer_name}_mask{suffix}.png",
         title=f"{layer_name} — Active Mask" + (f" (ep {epoch})" if epoch else ""),
     )
     plot_selectivity_maps(
         model, layer,
-        out_dir / f"{prefix}{layer_name}_selectivity{suffix}.png",
+        selectivities_dir / f"{prefix}{layer_name}_selectivity{suffix}.png",
         dataloader, class_names, device,
         title=f"{layer_name} — Selectivity" + (f" (ep {epoch})" if epoch else ""),
+    )
+    plot_activation_map(
+        layer,
+        activations_dir / f"{prefix}{layer_name}_activations{suffix}.png",
+        title=f"{layer_name} — Activation Diagnostics" + (f" (ep {epoch})" if epoch else ""),
     )

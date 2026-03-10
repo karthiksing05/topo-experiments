@@ -1,18 +1,20 @@
 """
-examples/resnet_cifar10.py
+src/resnet_cifar10.py
 
 ResNet-18 with TopoSeedLayer conv replacements on CIFAR-10.
 
 Run:
-    python examples/resnet_cifar10.py [--epochs 50] [--batch-size 128]
-                                       [--lr 0.1] [--lambda-reg 0.005]
-                                       [--viz-every 10] [--viz-dir outputs/viz_resnet]
-                                       [--no-topo] [--device auto]
+    python src/resnet_cifar10.py \
+        --config configs/resnet_cifar10.json \
+        [--device auto] [--no-topo]
+
+All hyper-parameters live in the JSON config.  See configs/resnet_cifar10.json.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import os
 import time
@@ -40,7 +42,7 @@ CIFAR10_CLASSES = [
 # Model factory
 # ---------------------------------------------------------------------------
 
-def replace_conv(module: nn.Module, depth: int = 0) -> None:
+def replace_conv(module: nn.Module, topo_defaults: dict, depth: int = 0) -> None:
     """
     Recursively walk `module` and replace every nn.Conv2d with TopoSeedLayer.
     Skips the very first conv layer (stem conv) to keep input processing fast.
@@ -51,6 +53,8 @@ def replace_conv(module: nn.Module, depth: int = 0) -> None:
             if child.groups != 1:
                 continue
             grid_size = max(3, child.out_channels // 16)
+            base_warmup = topo_defaults.get("base_warmup_steps", 500)
+            warmup_inc  = topo_defaults.get("warmup_depth_increment", 200)
             topo_layer = TopoSeedLayer(
                 layer_type="conv",
                 in_channels=child.in_channels,
@@ -60,26 +64,28 @@ def replace_conv(module: nn.Module, depth: int = 0) -> None:
                 padding=child.padding[0],
                 bias=(child.bias is not None),
                 grid_size=grid_size,
-                warmup_steps=500 + depth * 200,   # deeper = longer warmup
-                expansion_threshold=0.15,
-                death_threshold=0.02,
-                death_sustained_steps=400,
-                beta=0.7,
-                lambda_intra=0.01,
+                warmup_steps=base_warmup + depth * warmup_inc,
+                expansion_threshold=topo_defaults.get("expansion_threshold", 0.15),
+                death_threshold=topo_defaults.get("death_threshold", 0.02),
+                death_sustained_steps=topo_defaults.get("death_sustained_steps", 400),
+                expansion_radius=topo_defaults.get("expansion_radius", 1),
+                residual_weight=topo_defaults.get("residual_weight", 0.5),
+                beta=topo_defaults.get("beta", 0.7),
+                lambda_intra=topo_defaults.get("lambda_intra", 0.01),
             )
             setattr(module, name, topo_layer)
         else:
-            replace_conv(child, depth + 1)
+            replace_conv(child, topo_defaults, depth + 1)
 
 
-def make_topo_resnet18() -> nn.Module:
+def make_topo_resnet18(topo_defaults: dict) -> nn.Module:
     model = models.resnet18(weights=None, num_classes=10)
     # Adapt for CIFAR-10: smaller spatial input (32×32)
     # Replace 7×7 stem with 3×3 conv and remove early maxpool
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity()
     # Now replace conv layers with TopoSeedLayer
-    replace_conv(model)
+    replace_conv(model, topo_defaults)
     return model
 
 
@@ -116,6 +122,28 @@ def summarise_topo_layers(topo_layers: list[TopoSeedLayer]) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
+    # ---- Load config --------------------------------------------------------
+    cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        args.config,
+    ) if not os.path.isabs(args.config) else args.config
+
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    tcfg  = cfg["training"]
+    tdcfg = cfg.get("topo_defaults", {})
+    vcfg  = cfg["viz"]
+
+    epochs      = tcfg["epochs"]
+    batch_size  = tcfg["batch_size"]
+    lr          = tcfg["lr"]
+    lambda_reg  = tcfg["lambda_reg"]
+    viz_every   = vcfg["viz_every"]
+    viz_dir_str = vcfg["viz_dir"]
+
+    print(f"Config: {cfg_path}")
+
     device = get_device(args.device)
     print(f"Device: {device}")
 
@@ -136,7 +164,7 @@ def train(args: argparse.Namespace) -> None:
         root="data", train=False, download=True, transform=test_tf
     )
     pin = device.type == "cuda"
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
                                shuffle=True, num_workers=4, pin_memory=pin)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False,
                               num_workers=4, pin_memory=pin)
@@ -151,23 +179,23 @@ def train(args: argparse.Namespace) -> None:
         print("Running BASELINE ResNet-18 (no TopoSeed)")
         topo_layers: list[TopoSeedLayer] = []
     else:
-        model = make_topo_resnet18().to(device)
+        model = make_topo_resnet18(tdcfg).to(device)
         topo_layers = get_topo_layers(model)
         print(f"Running TOPO ResNet-18 ({len(topo_layers)} TopoSeedLayer conv replacements)")
 
     optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr,
+        model.parameters(), lr=lr,
         momentum=0.9, weight_decay=1e-4,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs
+        optimizer, T_max=epochs
     )
     criterion = nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
     total_steps = 0
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         for layer in topo_layers:
             layer.reset_epoch_stats()
@@ -183,7 +211,7 @@ def train(args: argparse.Namespace) -> None:
             task_loss = criterion(logits, labels)
 
             if topo_layers:
-                reg_loss = sum(l.get_reg_loss() for l in topo_layers) * args.lambda_reg
+                reg_loss = sum(l.get_reg_loss() for l in topo_layers) * lambda_reg
                 total_loss = task_loss + reg_loss
             else:
                 total_loss = task_loss
@@ -207,7 +235,7 @@ def train(args: argparse.Namespace) -> None:
         lr_now = optimizer.param_groups[0]["lr"]
 
         print(
-            f"Epoch {epoch:3d}/{args.epochs} | "
+            f"Epoch {epoch:3d}/{epochs} | "
             f"loss={train_loss:.4f} | val_acc={val_acc:.4f} | "
             f"best={best_val_acc:.4f} | lr={lr_now:.5f} | "
             f"time={elapsed:.1f}s"
@@ -217,9 +245,9 @@ def train(args: argparse.Namespace) -> None:
             summarise_topo_layers(topo_layers)
 
         # Periodic visualisations (a representative subset of layers)
-        if topo_layers and args.viz_every > 0 and epoch % args.viz_every == 0:
+        if topo_layers and viz_every > 0 and epoch % viz_every == 0:
             import pathlib
-            viz_dir = pathlib.Path(args.viz_dir)
+            viz_dir = pathlib.Path(viz_dir_str)
             # Pick first, middle, last topo layers for periodic snapshots
             n = len(topo_layers)
             snap_layers = {0: topo_layers[0],
@@ -246,7 +274,7 @@ def train(args: argparse.Namespace) -> None:
 
         # ---- Final visualisations -------------------------------------------
         import pathlib
-        viz_dir = pathlib.Path(args.viz_dir)
+        viz_dir = pathlib.Path(viz_dir_str)
         print(f"\nSaving final visualisations to {viz_dir} ...")
         n = len(topo_layers)
         # Visualise every layer individually
@@ -262,13 +290,13 @@ def train(args: argparse.Namespace) -> None:
                 epoch=None,
                 prefix="final_",
             )
-        # Multi-layer selectivity: first, middle, last
+        # Multi-layer selectivity: first, middle, last → selectivities subdir
         sel_indices = sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})
         plot_multi_layer_selectivity(
             model=model,
             topo_layers=[topo_layers[i] for i in sel_indices],
             layer_names=[f"conv{i}" for i in sel_indices],
-            out_path=viz_dir / "final_multi_layer_selectivity.png",
+            out_path=viz_dir / "selectivities" / "final_multi_layer_selectivity.png",
             dataloader=test_loader,
             class_names=CIFAR10_CLASSES,
             device=device,
@@ -283,15 +311,11 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TopoSeed ResNet-18 on CIFAR-10")
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--lambda-reg", type=float, default=0.005,
-                   help="Scale factor for summed TopoSeed regularisation loss")
-    p.add_argument("--viz-every", type=int, default=10,
-                   help="Save visualisations every N epochs (0 = only at end)")
-    p.add_argument("--viz-dir", type=str, default="outputs/toposeed/viz_resnet",
-                   help="Output directory for visualisation PNGs")
+    p.add_argument(
+        "--config", type=str,
+        default="configs/resnet_cifar10.json",
+        help="Path to JSON config file (relative to repo root or absolute)",
+    )
     p.add_argument("--no-topo", action="store_true",
                    help="Run baseline ResNet-18 without TopoSeed")
     p.add_argument("--device", type=str, default="auto",

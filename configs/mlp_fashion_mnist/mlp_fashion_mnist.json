@@ -1,0 +1,43 @@
+{
+    "_comment": "Config for src/mlp_fashion_mnist.py. Pass with --config configs/mlp_fashion_mnist.json\nBase config — all other configs derive from this.",
+
+    "training": {
+        "epochs": 20,
+        "batch_size": 64,
+        "lr": 0.001,
+        "lambda_cross": 0.01
+    },
+
+    "layer1": {
+        "in_features": 784,
+        "out_features": 256,
+        "grid_size": 4,
+        "warmup_steps": 200,
+        "expansion_threshold": 0.12,
+        "death_threshold": 0.02,
+        "death_sustained_steps": 150,
+        "expansion_radius": 1,
+        "residual_weight": 0.5,
+        "beta": 0.7,
+        "lambda_intra": 0.1
+    },
+
+    "layer2": {
+        "in_features": 256,
+        "out_features": 128,
+        "grid_size": 3,
+        "warmup_steps": 300,
+        "expansion_threshold": 0.12,
+        "death_threshold": 0.02,
+        "death_sustained_steps": 200,
+        "expansion_radius": 1,
+        "residual_weight": 0.5,
+        "beta": 0.7,
+        "lambda_intra": 0.1
+    },
+
+    "viz": {
+        "viz_every": 5,
+        "viz_dir": "outputs/toposeed/viz_mlp_base"
+    }
+}

@@ -1,18 +1,20 @@
 """
-examples/mlp_fashion_mnist.py
+src/mlp_fashion_mnist.py
 
 Two-layer MLP with TopoSeedLayer on Fashion-MNIST.
 
 Run:
-    python examples/mlp_fashion_mnist.py [--epochs 20] [--batch-size 64]
-                                          [--lr 1e-3] [--lambda-cross 0.005]
-                                          [--viz-every 5] [--viz-dir outputs/viz_mlp]
-                                          [--no-topo] [--device auto]
+    python src/mlp_fashion_mnist.py \
+        --config configs/mlp_fashion_mnist.json \
+        [--device auto] [--no-topo]
+
+All hyper-parameters live in the JSON config.  See configs/mlp_fashion_mnist.json.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import os
 import time
@@ -41,33 +43,39 @@ FMNIST_CLASSES = [
 # ---------------------------------------------------------------------------
 
 class TopoMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg: dict):
         super().__init__()
+        l1 = cfg["layer1"]
+        l2 = cfg["layer2"]
         self.layer1 = TopoSeedLayer(
             layer_type="linear",
-            in_features=784,
-            out_features=256,
-            grid_size=4,            # 4×4 = 16 seeds on a ~16×16 sheet
-            warmup_steps=200,
-            expansion_threshold=0.12,
-            death_threshold=0.02,
-            death_sustained_steps=150,
-            beta=0.7,
-            lambda_intra=0.01,
+            in_features=l1["in_features"],
+            out_features=l1["out_features"],
+            grid_size=l1["grid_size"],
+            warmup_steps=l1["warmup_steps"],
+            expansion_threshold=l1["expansion_threshold"],
+            death_threshold=l1["death_threshold"],
+            death_sustained_steps=l1["death_sustained_steps"],
+            expansion_radius=l1.get("expansion_radius", 1),
+            residual_weight=l1.get("residual_weight", 0.5),
+            beta=l1["beta"],
+            lambda_intra=l1["lambda_intra"],
         )
         self.layer2 = TopoSeedLayer(
             layer_type="linear",
-            in_features=256,
-            out_features=128,
-            grid_size=3,            # 3×3 = 9 seeds
-            warmup_steps=300,
-            expansion_threshold=0.12,
-            death_threshold=0.02,
-            death_sustained_steps=200,
-            beta=0.7,
-            lambda_intra=0.01,
+            in_features=l2["in_features"],
+            out_features=l2["out_features"],
+            grid_size=l2["grid_size"],
+            warmup_steps=l2["warmup_steps"],
+            expansion_threshold=l2["expansion_threshold"],
+            death_threshold=l2["death_threshold"],
+            death_sustained_steps=l2["death_sustained_steps"],
+            expansion_radius=l2.get("expansion_radius", 1),
+            residual_weight=l2.get("residual_weight", 0.5),
+            beta=l2["beta"],
+            lambda_intra=l2["lambda_intra"],
         )
-        self.classifier = nn.Linear(128, 10)
+        self.classifier = nn.Linear(l2["out_features"], 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(x.size(0), -1)
@@ -129,6 +137,27 @@ def run_correctness_checks(model: TopoMLP, device: torch.device) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
+    # ---- Load config --------------------------------------------------------
+    cfg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        args.config,
+    ) if not os.path.isabs(args.config) else args.config
+
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    tcfg = cfg["training"]
+    vcfg = cfg["viz"]
+
+    epochs      = tcfg["epochs"]
+    batch_size  = tcfg["batch_size"]
+    lr          = tcfg["lr"]
+    lambda_cross = tcfg["lambda_cross"]
+    viz_every   = vcfg["viz_every"]
+    viz_dir_str = vcfg["viz_dir"]
+
+    print(f"Config: {cfg_path}")
+
     device = get_device(args.device)
     print(f"Device: {device}")
 
@@ -141,7 +170,7 @@ def train(args: argparse.Namespace) -> None:
         root="data", train=False, download=True, transform=transform
     )
     pin = device.type == "cuda"
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+    train_loader = DataLoader(train_ds, batch_size=batch_size,
                                shuffle=True, num_workers=2, pin_memory=pin)
     test_loader = DataLoader(test_ds, batch_size=256, shuffle=False,
                               num_workers=2, pin_memory=pin)
@@ -151,15 +180,15 @@ def train(args: argparse.Namespace) -> None:
         model: nn.Module = BaselineMLP().to(device)
         print("Running BASELINE MLP (no TopoSeed)")
     else:
-        model = TopoMLP().to(device)
+        model = TopoMLP(cfg).to(device)
         print("Running TopoMLP (with TopoSeedLayer)")
         run_correctness_checks(model, device)  # type: ignore[arg-type]
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
     total_steps = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         if not args.no_topo:
             model.layer1.reset_epoch_stats()   # type: ignore[attr-defined]
@@ -182,7 +211,7 @@ def train(args: argparse.Namespace) -> None:
                     topo_model.layer1.sheet,
                     topo_model.layer2.sheet,
                     topo_model.layer2.sheet.get_active_weight_matrix(),
-                ) * args.lambda_cross
+                ) * lambda_cross
 
                 total_loss = (
                     task_loss
@@ -218,22 +247,22 @@ def train(args: argparse.Namespace) -> None:
         test_acc = evaluate(model, test_loader, device)
 
         if args.no_topo:
-            print(f"Epoch {epoch:2d}/{args.epochs} | "
+            print(f"Epoch {epoch:2d}/{epochs} | "
                   f"loss={train_loss:.4f} | test_acc={test_acc:.4f} | "
                   f"time={elapsed:.1f}s")
         else:
             topo_model = model  # type: ignore
             print(
-                f"Epoch {epoch:2d}/{args.epochs} | "
+                f"Epoch {epoch:2d}/{epochs} | "
                 f"loss={train_loss:.4f} | test_acc={test_acc:.4f} | "
                 f"time={elapsed:.1f}s | "
                 f"L1_active={topo_model.layer1.sheet.active_count()} "  # type: ignore
                 f"L2_active={topo_model.layer2.sheet.active_count()}"   # type: ignore
             )
-            # Periodic visualisations
-            if args.viz_every > 0 and epoch % args.viz_every == 0:
+            # Periodic visualisations → debug/epoch{N:03d}/ subdirs
+            if viz_every > 0 and epoch % viz_every == 0:
                 import pathlib
-                viz_dir = pathlib.Path(args.viz_dir)
+                viz_dir = pathlib.Path(viz_dir_str)
                 for lname, layer in [("layer1", topo_model.layer1),
                                       ("layer2", topo_model.layer2)]:
                     plot_all(
@@ -253,7 +282,7 @@ def train(args: argparse.Namespace) -> None:
     if not args.no_topo:
         topo_model = model  # type: ignore
         import pathlib
-        viz_dir = pathlib.Path(args.viz_dir)
+        viz_dir = pathlib.Path(viz_dir_str)
         print(f"\nSaving final visualisations to {viz_dir} ...")
         # Per-layer weight sheets, masks, and selectivity maps
         for lname, layer in [("layer1", topo_model.layer1),
@@ -269,12 +298,12 @@ def train(args: argparse.Namespace) -> None:
                 epoch=None,
                 prefix="final_",
             )
-        # Multi-layer side-by-side selectivity
+        # Multi-layer side-by-side selectivity → selectivities subdir
         plot_multi_layer_selectivity(
             model=topo_model,
             topo_layers=[topo_model.layer1, topo_model.layer2],
             layer_names=["layer1 (256)", "layer2 (128)"],
-            out_path=viz_dir / "final_multi_layer_selectivity.png",
+            out_path=viz_dir / "selectivities" / "final_multi_layer_selectivity.png",
             dataloader=test_loader,
             class_names=FMNIST_CLASSES,
             device=device,
@@ -289,14 +318,11 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="TopoSeed MLP on Fashion-MNIST")
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--lambda-cross", type=float, default=0.005)
-    p.add_argument("--viz-every", type=int, default=5,
-                   help="Save visualisations every N epochs (0 = only at end)")
-    p.add_argument("--viz-dir", type=str, default="outputs/toposeed/viz_mlp",
-                   help="Output directory for visualisation PNGs")
+    p.add_argument(
+        "--config", type=str,
+        default="configs/mlp_fashion_mnist.json",
+        help="Path to JSON config file (relative to repo root or absolute)",
+    )
     p.add_argument("--no-topo", action="store_true",
                    help="Run baseline MLP without TopoSeed")
     p.add_argument("--device", type=str, default="auto",

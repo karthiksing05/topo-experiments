@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=train_topo_sparsity_large
+#SBATCH --job-name=train_topo_sparsity
 #SBATCH --account=gts-aivanova7-lab
 #SBATCH -N1 --ntasks-per-node=1
-#SBATCH --mem=64GB
-#SBATCH --cpus-per-task=8
-#SBATCH -t 24:00:00
+#SBATCH --mem=16GB
+#SBATCH --cpus-per-task=4
+#SBATCH -t 8:00:00
 #SBATCH -qinferno
 #SBATCH --gres=gpu:1
-#SBATCH --output=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity_large-%j.out
-#SBATCH --error=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity_large-%j.err
+#SBATCH --output=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity-%j.out
+#SBATCH --error=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity-%j.err
 
 # -- Environment ---------------------------------------------------------------
 module purge
@@ -36,7 +36,7 @@ else
 fi
 
 echo "=========================================="
-echo "topo-experiments -- Topo Sparsity vs Baseline (ResNet-18, ImageNet)"
+echo "topo-experiments -- Topo Sparsity vs Baseline (FashionMNIST CNN, fc2 excluded from reg)"
 echo "=========================================="
 echo "Job ID          : $SLURM_JOB_ID"
 echo "Node            : $SLURM_NODELIST"
@@ -47,24 +47,20 @@ echo "=========================================="
 cd "$EXPERIMENT_DIR"
 mkdir -p scripts/logs
 mkdir -p "${HF_CACHE_DIR}"
-mkdir -p outputs/train_topo_sparsity_large/checkpoints
+mkdir -p outputs/train_topo_sparsity/checkpoints
 
 # -- Configurable via sbatch --export= -----------------------------------------
 # Per-layer settings (topo_scale, factor_h, factor_w, lambda_kl, lambda_entropy)
-# live in the JSON config file — edit configs/train_topo_sparsity_large.json directly.
+# live in the JSON config file — edit configs/train_topo_sparsity.json directly.
 # Top-level knobs below can still be overridden here or via --export on sbatch.
 
-CONFIG_FILE="${CONFIG_FILE:-${EXPERIMENT_DIR}/configs/train_topo_sparsity_large.json}"
-DATA_DIR="${DATA_DIR:-}"                  # null → project-root/data/imagenet (set in JSON or here)
-OUTPUT_DIR="${OUTPUT_DIR:-}"              # null → project-root/outputs/train_topo_sparsity_large
+CONFIG_FILE="${CONFIG_FILE:-${EXPERIMENT_DIR}/configs/train_topo_sparsity.json}"
+DATA_DIR="${DATA_DIR:-}"                  # null → project-root/data (set in JSON or here)
+OUTPUT_DIR="${OUTPUT_DIR:-}"              # null → project-root/outputs/train_topo_sparsity
 EPOCHS="${EPOCHS:-}"                      # null → use JSON value
 BATCH_SIZE="${BATCH_SIZE:-}"
 LR="${LR:-}"
 DEVICE="${DEVICE:-cuda:0}"
-NUM_WORKERS="${NUM_WORKERS:-}"
-LR_SCHEDULE="${LR_SCHEDULE:-}"
-AMP="${AMP:-}"
-PRETRAINED="${PRETRAINED:-}"
 RESUME_TOPO="${RESUME_TOPO:-}"
 RESUME_TOPO_ONLY="${RESUME_TOPO_ONLY:-}"
 RESUME_BASE="${RESUME_BASE:-}"
@@ -72,12 +68,10 @@ RESUME_BASE="${RESUME_BASE:-}"
 echo ""
 echo "config       : ${CONFIG_FILE}"
 echo "device       : ${DEVICE}"
-[[ -n "$DATA_DIR"    ]] && echo "data_dir     : ${DATA_DIR}    (CLI override)"
-[[ -n "$EPOCHS"      ]] && echo "epochs       : ${EPOCHS}      (CLI override)"
-[[ -n "$BATCH_SIZE"  ]] && echo "batch_size   : ${BATCH_SIZE}  (CLI override)"
-[[ -n "$LR"          ]] && echo "lr           : ${LR}          (CLI override)"
-[[ -n "$LR_SCHEDULE" ]] && echo "lr_schedule  : ${LR_SCHEDULE} (CLI override)"
-[[ -n "$AMP"         ]] && echo "amp          : ${AMP}         (CLI override)"
+[[ -n "$DATA_DIR"   ]] && echo "data_dir     : ${DATA_DIR}   (CLI override)"
+[[ -n "$EPOCHS"     ]] && echo "epochs       : ${EPOCHS}     (CLI override)"
+[[ -n "$BATCH_SIZE" ]] && echo "batch_size   : ${BATCH_SIZE} (CLI override)"
+[[ -n "$LR"         ]] && echo "lr           : ${LR}         (CLI override)"
 echo ""
 
 # Build optional CLI override args (only passed when env var is non-empty)
@@ -88,29 +82,16 @@ OVERRIDE_ARGS=""
 [[ -n "$BATCH_SIZE"     ]] && OVERRIDE_ARGS+=" --batch-size ${BATCH_SIZE}"
 [[ -n "$LR"             ]] && OVERRIDE_ARGS+=" --lr ${LR}"
 [[ -n "$DEVICE"         ]] && OVERRIDE_ARGS+=" --device ${DEVICE}"
-[[ -n "$NUM_WORKERS"    ]] && OVERRIDE_ARGS+=" --num-workers ${NUM_WORKERS}"
-[[ -n "$LR_SCHEDULE"    ]] && OVERRIDE_ARGS+=" --lr-schedule ${LR_SCHEDULE}"
 [[ -n "$RESUME_TOPO"    ]] && OVERRIDE_ARGS+=" --resume-topo ${RESUME_TOPO}"
 [[ -n "$RESUME_TOPO_ONLY" ]] && OVERRIDE_ARGS+=" --resume-topo-only ${RESUME_TOPO_ONLY}"
 [[ -n "$RESUME_BASE"    ]] && OVERRIDE_ARGS+=" --resume-base ${RESUME_BASE}"
 
-# --amp / --no-amp flag
-if [[ "${AMP}" == "0" || "${AMP}" == "false" || "${AMP}" == "no" ]]; then
-    OVERRIDE_ARGS+=" --no-amp"
-elif [[ "${AMP}" == "1" || "${AMP}" == "true" || "${AMP}" == "yes" ]]; then
-    OVERRIDE_ARGS+=" --amp"
-fi
-
-# --pretrained flag
-[[ "${PRETRAINED}" == "1" || "${PRETRAINED}" == "true" ]] \
-    && OVERRIDE_ARGS+=" --pretrained"
-
-srun python -u examples/train/train_topo_sparsity_large.py \
+srun python -u src/misc/train_topo_sparsity.py \
     --config "${CONFIG_FILE}" \
     ${OVERRIDE_ARGS}
 
 echo ""
 echo "=========================================="
 echo "Training complete.  Outputs in:"
-echo "  outputs/train_topo_sparsity_large/"
+echo "  outputs/train_topo_sparsity/"
 echo "=========================================="

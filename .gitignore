@@ -6,3 +6,4 @@ outputs
 data
 litcoder_token
 __pycache__
+.cupy_cache

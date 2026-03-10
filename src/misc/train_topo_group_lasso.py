@@ -1,18 +1,27 @@
 """
-Topography implemented with the same sparsity constraints as project with Zekun!
+Topography + Group-Lasso sparsity on Fashion-MNIST.
 
-Two main constraints:
-*   A batch-wide KL constraint to ensure the space gets used properly
-*   A per-instance entropy constraint to ensure individual instances have low entropy
+Four conditions are trained side-by-side for comparison:
 
-Both constraints are applied only on the downsampled cortical sheet of fc1 activations —
-the same layer that TopoLoss is applied to — to ensure that when scaling back up, sparsity
-is retained per-cluster and not per-neuron.
+  topo_gl      — TopoLoss + Group-Lasso (spatial-patch L2 norms on fc1 activations)
+  topo_kl_ent  — TopoLoss + KL-from-uniform + per-sample entropy  (existing method)
+  topo_only    — TopoLoss only, no sparsity penalty
+  baseline     — Cross-entropy only
 
-The model is a two-layer MLP (SimpleNN) trained on Fashion-MNIST (28×28 grayscale, 10 classes),
-mirroring the architecture in the topoloss_demo notebook.  TopoLoss + KL/entropy sparsity
-are applied exclusively to fc1.  A plain CE baseline and a topo-only (no sparsity) variant
-are also trained for comparison.
+Group-lasso penalty
+-------------------
+The fc1 cortical sheet (H × W) is divided into the same H_d × W_d spatial
+grid that the KL/entropy approach uses (controlled by factor_h, factor_w).
+For each patch g, the penalty is
+
+    mean_{batch} ( ||activations_g||_2 )
+
+summed over all H_d × W_d patches.  This encourages entire spatial groups to
+be collectively silent rather than pushing individual units to zero.
+
+The new config key ``lambda_gl`` in the ``layers.fc1`` block controls the
+strength of the group-lasso term.  Set ``lambda_kl`` / ``lambda_entropy`` to
+0.0 (or omit them) to use a pure Group-Lasso + Topo configuration.
 """
 
 # -- Imports -------------------------------------------------------------------
@@ -44,16 +53,14 @@ from topoloss.core import find_cortical_sheet_size
 # -- Defaults ------------------------------------------------------------------
 
 BASE_DIR   = Path(__file__).resolve().parents[2]
-OUTPUT_DIR = BASE_DIR / "outputs" / "train_topo_sparsity"
+OUTPUT_DIR = BASE_DIR / "outputs" / "train_topo_group_lasso"
 
 FMNIST_CLASSES = [
     "T-shirt", "Trouser", "Pullover", "Dress", "Coat",
     "Sandal",  "Shirt",   "Sneaker",  "Bag",   "AnkleBoot",
 ]
 
-# All layers captured for visualisation
 VIS_LAYER_NAMES  = ["fc1", "fc2"]
-# Layers that get TopoLoss + KL + entropy (fc2 left unconstrained)
 TOPO_LAYER_NAMES = ["fc1"]
 
 
@@ -71,7 +78,7 @@ class SimpleNN(nn.Module):
         x = x.view(-1, 28 * 28)
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
-        return x                        # logits
+        return x
 
 
 # -- Cortical-sheet activation regularizers ------------------------------------
@@ -79,12 +86,7 @@ class SimpleNN(nn.Module):
 def cortical_sparsity_losses(activations: torch.Tensor,
                              factor_h: float, factor_w: float,
                              temperature: float = 3.0) -> tuple:
-    """KL-from-uniform + per-sample entropy on the downsampled cortical sheet.
-
-    Conv activations (B,C,H,W) are globally avg-pooled to (B,C) first so that
-    output channels form the topographic axes.
-    """
-
+    """KL-from-uniform + per-sample entropy on the downsampled cortical sheet."""
     if activations.ndim == 4:
         activations = activations.mean(dim=(2, 3))
 
@@ -108,6 +110,57 @@ def cortical_sparsity_losses(activations: torch.Tensor,
     return kl_loss, entropy_loss
 
 
+def group_lasso_loss(activations: torch.Tensor,
+                     factor_h: float, factor_w: float) -> torch.Tensor:
+    """Group-lasso penalty on cortical-sheet activations.
+
+    Groups are spatial patches on the H × W cortical sheet, matching the same
+    H_d × W_d grid used for the KL/entropy penalties (controlled by factor_h
+    and factor_w).  For each patch g:
+
+        penalty_g = mean_{batch}( ||activations_g||_2 )
+
+    The total loss is sum_g penalty_g, which encourages whole spatial
+    neighbourhoods to be collectively silent rather than driving individual
+    neuron activations to zero.
+
+    Parameters
+    ----------
+    activations : (B, N) post-ReLU activations of the linear layer.
+    factor_h    : cortical-sheet height divided by number of patch rows.
+    factor_w    : cortical-sheet width divided by number of patch columns.
+
+    Returns
+    -------
+    Scalar tensor.
+    """
+    if activations.ndim == 4:
+        activations = activations.mean(dim=(2, 3))
+
+    B, N  = activations.shape
+    size  = find_cortical_sheet_size(N)
+    H, W  = size.height, size.width
+
+    # Reshape to (B, H, W) cortical sheet
+    sheet  = activations[:, : H * W].reshape(B, H, W)
+
+    H_down = max(1, round(H / factor_h))
+    W_down = max(1, round(W / factor_w))
+
+    loss = activations.new_zeros(1)
+    for i in range(H_down):
+        r0 = round(H * i       / H_down)
+        r1 = round(H * (i + 1) / H_down)
+        for j in range(W_down):
+            c0 = round(W * j       / W_down)
+            c1 = round(W * (j + 1) / W_down)
+            group = sheet[:, r0:r1, c0:c1].reshape(B, -1)   # (B, group_size)
+            # L2 norm per sample, averaged over batch
+            loss = loss + group.norm(dim=1).mean()
+
+    return loss.squeeze()
+
+
 # -- Cortical-sheet debug visualisation ----------------------------------------
 
 def save_debug_cortical_sheets(
@@ -117,14 +170,7 @@ def save_debug_cortical_sheets(
     out_dir: Path,
     device: str,
 ) -> None:
-    """For each model save a debug figure showing per-layer cortical sheets.
-
-    One PNG per model saved to out_dir/debug_cortical_sheets_{label}.png.
-    Each figure: rows = up to 8 val samples, column groups per TOPO layer:
-      raw sheet | downsampled | softmax probs | activation histogram
-
-    Also prints NaN/inf statistics and KL/entropy values to stdout.
-    """
+    """For each model save a debug figure showing per-layer cortical sheets."""
     print("\n" + "=" * 65)
     print("  CORTICAL SHEET DEBUG")
     print("=" * 65)
@@ -132,7 +178,6 @@ def save_debug_cortical_sheets(
     n_show = 8
 
     def _collect_one_batch(model):
-        """Return {layer_name: activation_tensor (B,...)} for the first batch."""
         store   = {n: None for n in TOPO_LAYER_NAMES}
         handles = []
         for name in TOPO_LAYER_NAMES:
@@ -149,7 +194,6 @@ def save_debug_cortical_sheets(
         return store, imgs.cpu()
 
     def _sheet_decompose(act1d, lname):
-        """(N,) → raw H×W, downsampled H_d×W_d, softmax probs H_d×W_d)."""
         lc   = layer_cfg[lname]
         N    = act1d.shape[0]
         size = find_cortical_sheet_size(N)
@@ -179,7 +223,6 @@ def save_debug_cortical_sheets(
         batch_acts, batch_imgs = _collect_one_batch(model)
         B = min(n_show, batch_imgs.shape[0])
 
-        # print stats
         for name in TOPO_LAYER_NAMES:
             raw_act = batch_acts[name][:B]
             if raw_act.ndim == 4:
@@ -204,18 +247,20 @@ def save_debug_cortical_sheets(
             bm   = probs.mean(0)
             kl   = F.kl_div(torch.full_like(bm, -math.log(M)), bm, reduction="sum")
             ent  = -(probs * (probs + 1e-10).log()).sum(-1).mean()
+            # group lasso
+            gl = group_lasso_loss(pooled[:B].to(pooled.device),
+                                  lc["factor_h"], lc["factor_w"])
             print(f"      {name}  factor_h={lc['factor_h']}  factor_w={lc['factor_w']}  "
-                  f"lambda_kl={lc['lambda_kl']}  lambda_entropy={lc['lambda_entropy']}  "
-                  f"temperature={lc.get('temperature', 3.0)}")
-            print(f"      {name}  KL={kl.item():.4g}  entropy={ent.item():.4g}")
+                  f"lambda_gl={lc.get('lambda_gl', 0.0)}  "
+                  f"lambda_kl={lc.get('lambda_kl', 0.0)}  "
+                  f"lambda_entropy={lc.get('lambda_entropy', 0.0)}")
+            print(f"      {name}  GL={gl.item():.4g}  KL={kl.item():.4g}  "
+                  f"entropy={ent.item():.4g}")
 
-        # figure
         n_lay  = len(TOPO_LAYER_NAMES)
-        n_cols = 4 * n_lay   # raw | down | probs | hist per layer
+        n_cols = 4 * n_lay
         fig, axes = plt.subplots(
-            B, n_cols,
-            figsize=(n_cols * 1.8, B * 1.8),
-            squeeze=False,
+            B, n_cols, figsize=(n_cols * 1.8, B * 1.8), squeeze=False,
         )
 
         col_titles = []
@@ -258,7 +303,6 @@ def save_debug_cortical_sheets(
                 ax_h.set_yticks([])
                 ax_h.spines[["top","right"]].set_visible(False)
 
-        # dividers between layer groups
         for l_idx in range(1, n_lay):
             x = (l_idx * 4) / n_cols
             fig.add_artist(plt.Line2D([x, x], [0, 1],
@@ -267,7 +311,9 @@ def save_debug_cortical_sheets(
 
         layer_info = "  ".join(
             f"{n}(fh={layer_cfg[n]['factor_h']},fw={layer_cfg[n]['factor_w']}"
-            f",λkl={layer_cfg[n]['lambda_kl']},λent={layer_cfg[n]['lambda_entropy']})"
+            f",λgl={layer_cfg[n].get('lambda_gl',0.0)}"
+            f",λkl={layer_cfg[n].get('lambda_kl',0.0)}"
+            f",λent={layer_cfg[n].get('lambda_entropy',0.0)})"
             for n in TOPO_LAYER_NAMES
         )
         plt.suptitle(
@@ -336,15 +382,9 @@ def save_selectivity_maps(model: SimpleNN,
                           out_dir: Path,
                           device: str,
                           tag: str = "") -> None:
-    """Save a 10-row x 5-col selectivity figure (example + one map per layer)."""
+    """Save a 10-row x n_cols selectivity figure."""
     print(f"  Collecting activations for '{tag}' ...")
     all_acts, all_labels = _collect_activations(model, val_loader, device)
-
-    for name in VIS_LAYER_NAMES:
-        a = all_acts[name]
-        N = a.shape[1]
-        size = find_cortical_sheet_size(N)
-        print(f"    {name}: raw {tuple(a.shape)} -> cortical sheet {size.height}x{size.width}")
 
     n_classes = len(FMNIST_CLASSES)
     n_cols    = 1 + len(VIS_LAYER_NAMES)
@@ -359,7 +399,6 @@ def save_selectivity_maps(model: SimpleNN,
         marker = "" if name in TOPO_LAYER_NAMES else " (no reg)"
         axes[0, col].set_title(f"{name}{marker}", fontsize=9, pad=3)
 
-    # One example image per class
     example_imgs = {}
     for imgs, lbls in val_loader:
         for cls in range(n_classes):
@@ -400,26 +439,20 @@ def save_selectivity_maps(model: SimpleNN,
 
 
 def _act_to_cortical_sheet(act: torch.Tensor) -> np.ndarray:
-    """Convert a single-sample activation tensor to a 2-D cortical sheet (H, W).
-
-    * Conv (C, H, W)  -> global-avg-pool -> (C,) -> cortical sheet
-    * Linear (N,)     -> cortical sheet directly
-    Values are min-max normalised to [0, 1] for display.
-    """
+    """Convert single-sample activation tensor to 2-D cortical sheet (H, W)."""
     a = act.detach().cpu().float()
-    if a.ndim == 3:                  # (C, H, W) conv output
-        a = a.mean(dim=(1, 2))       # (C,)
+    if a.ndim == 3:
+        a = a.mean(dim=(1, 2))
     elif a.ndim > 1:
         a = a.squeeze()
 
-    a = a.flatten()
+    a    = a.flatten()
     size = find_cortical_sheet_size(a.shape[0])
     a    = a[: size.height * size.width]
     lo, hi = a.min(), a.max()
     if hi > lo:
         a = (a - lo) / (hi - lo)
-    sheet = a.reshape(size.height, size.width).numpy()
-    return sheet
+    return a.reshape(size.height, size.width).numpy()
 
 
 def save_activation_cortical_sheets(
@@ -428,43 +461,27 @@ def save_activation_cortical_sheets(
     out_dir: Path,
     device: str,
 ) -> None:
-    """For one example per class, show the cortical sheet of activations at every layer.
-
-    Parameters
-    ----------
-    models : dict mapping label -> SimpleNN, e.g.
-             {"topo": ..., "topo-only": ..., "baseline": ...}
-
-    Figure layout  (10 rows × (1 + 2*n_models) cols):
-      Col 0           : example image
-      Cols 1-2, 3-4   : per-model activations — fc1 | fc2
-
-    Each cell is min-max normalised and shown with the 'hot' colormap.
-    """
+    """For one example per class, show cortical-sheet activations at every layer."""
     print("  Collecting single-sample activations for cortical-sheet figure ...")
 
-    # --- collect one image per class ------------------------------------------
-    example_imgs   = {}   # cls -> (1, 1, 28, 28)
-    example_labels = {}
+    example_imgs = {}
     for imgs, lbls in val_loader:
         for cls in range(len(FMNIST_CLASSES)):
             if cls not in example_imgs:
                 idx = (lbls == cls).nonzero(as_tuple=True)[0]
                 if len(idx):
-                    example_imgs[cls]   = imgs[idx[0]:idx[0]+1]   # (1,1,28,28)
-                    example_labels[cls] = cls
+                    example_imgs[cls] = imgs[idx[0]:idx[0]+1]
         if len(example_imgs) == len(FMNIST_CLASSES):
             break
 
-    # --- helper: get per-layer activations for one image ----------------------
-    def _get_layer_acts(model: SimpleNN, img: torch.Tensor) -> dict:
+    def _get_layer_acts(model, img):
         store   = {}
         handles = []
         for name in VIS_LAYER_NAMES:
             layer = getattr(model, name)
             def _make_hook(n):
                 def _h(_m, _i, out):
-                    store[n] = out[0]   # drop batch dim -> (C,H,W) or (N,)
+                    store[n] = out[0]
                 return _h
             handles.append(layer.register_forward_hook(_make_hook(name)))
         model.eval()
@@ -474,18 +491,15 @@ def save_activation_cortical_sheets(
             h.remove()
         return store
 
-    model_items = list(models.items())   # [(label, model), ...]
+    model_items = list(models.items())
     n_classes  = len(FMNIST_CLASSES)
     n_lay      = len(VIS_LAYER_NAMES)
     n_models   = len(model_items)
     n_cols     = 1 + n_models * n_lay
 
     fig, axes = plt.subplots(
-        n_classes, n_cols,
-        figsize=(n_cols * 1.8, n_classes * 1.8),
+        n_classes, n_cols, figsize=(n_cols * 1.8, n_classes * 1.8),
     )
-
-    # Column headers
     axes[0, 0].set_title("Input", fontsize=8, pad=3)
     for m_idx, (lbl, _) in enumerate(model_items):
         for i, name in enumerate(VIS_LAYER_NAMES):
@@ -498,7 +512,6 @@ def save_activation_cortical_sheets(
         model_acts = {lbl: _get_layer_acts(mdl, img_tensor)
                       for lbl, mdl in model_items}
 
-        # Col 0: input image
         ax = axes[row, 0]
         ax.imshow(img_tensor[0, 0].numpy(), cmap="gray")
         ax.set_ylabel(FMNIST_CLASSES[cls], fontsize=7, rotation=0,
@@ -541,19 +554,14 @@ def save_per_category_activation_comparisons(
     device: str,
     n_samples: int = 4,
 ) -> None:
-    """For each Fashion-MNIST category save one figure with n_samples rows.
-
-    Layout: rows = samples, cols = [input | model0/fc1 | model0/fc2 | model1/fc1 | ...]
-    A dashed vertical divider (drawn after tight_layout) separates model groups.
-    Saved to out_dir/activation_per_category_{class_name}.png
-    """
+    """For each category save n_samples rows, one column group per model."""
     print("  Generating per-category activation cortical-sheet comparisons ...")
     model_items = list(models.items())
     n_models    = len(model_items)
     n_lay       = len(VIS_LAYER_NAMES)
     n_cols      = 1 + n_models * n_lay
 
-    def _get_layer_acts(model: SimpleNN, img: torch.Tensor) -> dict:
+    def _get_layer_acts(model, img):
         store   = {}
         handles = []
         for name in VIS_LAYER_NAMES:
@@ -570,7 +578,6 @@ def save_per_category_activation_comparisons(
             h.remove()
         return store
 
-    # Collect n_samples images per class from val set
     samples_per_class: dict = {cls: [] for cls in range(len(FMNIST_CLASSES))}
     for imgs, lbls in val_loader:
         for cls in range(len(FMNIST_CLASSES)):
@@ -583,17 +590,13 @@ def save_per_category_activation_comparisons(
             break
 
     for cls in range(len(FMNIST_CLASSES)):
-        cls_name     = FMNIST_CLASSES[cls]
-        sample_list  = samples_per_class[cls][:n_samples]
-        n_rows       = len(sample_list)
+        cls_name    = FMNIST_CLASSES[cls]
+        sample_list = samples_per_class[cls][:n_samples]
+        n_rows      = len(sample_list)
 
         fig, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(n_cols * 1.8, n_rows * 1.8),
-            squeeze=False,
+            n_rows, n_cols, figsize=(n_cols * 1.8, n_rows * 1.8), squeeze=False,
         )
-
-        # Column headers
         axes[0, 0].set_title("Input", fontsize=8, pad=3)
         for m_idx, (lbl, _) in enumerate(model_items):
             for i, name in enumerate(VIS_LAYER_NAMES):
@@ -601,13 +604,10 @@ def save_per_category_activation_comparisons(
                     f"{lbl}\n{name}", fontsize=7, pad=3
                 )
 
-        for row, img_tensor in enumerate(sample_list):
-            model_acts = {lbl: _get_layer_acts(mdl, img_tensor)
-                          for lbl, mdl in model_items}
+        for row, img_t in enumerate(sample_list):
+            model_acts = {lbl: _get_layer_acts(mdl, img_t) for lbl, mdl in model_items}
 
-            axes[row, 0].imshow(img_tensor[0, 0].numpy(), cmap="gray")
-            axes[row, 0].set_ylabel(f"sample {row + 1}", fontsize=7, rotation=0,
-                                    labelpad=42, va="center")
+            axes[row, 0].imshow(img_t[0, 0].numpy(), cmap="gray")
             axes[row, 0].axis("off")
 
             for m_idx, (lbl, _) in enumerate(model_items):
@@ -618,27 +618,25 @@ def save_per_category_activation_comparisons(
                                                              vmin=0, vmax=1)
                     axes[row, 1 + m_idx * n_lay + i].axis("off")
 
-        model_str = "  vs  ".join(lbl for lbl, _ in model_items)
         plt.suptitle(
-            f"{cls_name}  —  {model_str}  |  Activation Cortical Sheets\n"
-            f"{n_rows} val samples  |  min-max normalised per cell  |  fc1 & fc2",
+            f"Activation Cortical Sheets — {cls_name}\n"
+            + "  |  ".join(f"{lbl} (cols {1+i*n_lay}-{i*n_lay+n_lay})"
+                           for i, (lbl, _) in enumerate(model_items)),
             y=1.003, fontsize=9,
         )
         plt.tight_layout()
-        # Dividers drawn after tight_layout for accurate x positioning
         for m_idx in range(1, n_models):
             ax_r = axes[0, 1 + m_idx * n_lay - 1]
             ax_l = axes[0, 1 + m_idx * n_lay]
             x = (ax_r.get_position().x1 + ax_l.get_position().x0) / 2
             fig.add_artist(plt.Line2D([x, x], [0.02, 0.93],
                                        transform=fig.transFigure,
-                                       color="steelblue", linestyle="--", linewidth=1.2,
-                                       clip_on=False))
-        safe_name = cls_name.lower().replace("-", "_").replace(" ", "_")
-        path = out_dir / f"activation_per_category_{safe_name}.png"
+                                       color="steelblue", linestyle="--",
+                                       linewidth=1.2, clip_on=False))
+        path = out_dir / f"activation_per_category_{cls_name.replace('/', '_')}.png"
         fig.savefig(path, bbox_inches="tight", dpi=150)
         plt.close(fig)
-        print(f"    {cls_name} -> {path}")
+    print(f"  Saved per-category activations -> {out_dir}/activation_per_category_*.png")
 
 
 def save_ssim_comparison_matrices(
@@ -646,52 +644,28 @@ def save_ssim_comparison_matrices(
     val_loader: DataLoader,
     out_dir: Path,
     device: str,
-    n_samples: int = 15,
+    n_samples: int = 8,
 ) -> None:
-    """Pairwise mean-SSIM matrix over fc1 cortical-sheet activations.
+    """Pairwise SSIM matrices for fc1 cortical-sheet activations."""
+    try:
+        from skimage.metrics import structural_similarity as ssim
+    except ImportError:
+        print("  skimage not available; skipping SSIM matrices.")
+        return
 
-    Each cell (i, j) is the mean SSIM computed over all n_samples × n_samples
-    pairs drawn from class i and class j.  Three heatmaps (one per model) are
-    plotted side-by-side with class name text labels on the axes.
-
-    Summary metric — separation index (Cohen's-d analogue):
-        separation = (mean_intra − mean_inter) / std(all_cells)
-    This measures how many standard deviations the diagonal (same-class SSIM)
-    sits above the off-diagonal mean, normalised by the global spread of the
-    matrix.  A value near 0 means no discrimination; large positive values
-    indicate that same-class activations are markedly more similar than
-    cross-class ones.  Unlike intra/inter ratio it is scale-invariant and
-    comparable across models regardless of the absolute SSIM range.
-
-    Saved to:
-        out_dir/ssim_matrix.png
-        out_dir/ssim_scores.txt
-    """
-    from torchmetrics.functional.image import structural_similarity_index_measure as _torch_ssim
-
-    def _ssim_cell(sheets_i: np.ndarray, sheets_j: np.ndarray) -> float:
-        """Mean SSIM over all len(i) x len(j) pairs, computed in one batch.
-
-        sheets_i, sheets_j : (n, H, W) float32 in [0, 1]
-        Expands into (n*m, 1, H, W) preds and targets and calls torchmetrics
-        SSIM with reduction='elementwise_mean'.
-        """
-        n, m = len(sheets_i), len(sheets_j)
-        a = np.repeat(sheets_i, m, axis=0)            # (n*m, H, W)
-        b = np.tile(sheets_j,   (n, 1, 1))             # (n*m, H, W)
-        ta = torch.from_numpy(a).float().unsqueeze(1)  # (n*m, 1, H, W)
-        tb = torch.from_numpy(b).float().unsqueeze(1)
-        with torch.no_grad():
-            val = _torch_ssim(ta, tb, data_range=1.0, reduction="elementwise_mean")
-        return float(val)
-
-    n_classes   = len(FMNIST_CLASSES)
+    print("  Computing SSIM clustering matrices ...")
     model_items = list(models.items())
-    n_models    = len(model_items)
+    n_classes   = len(FMNIST_CLASSES)
 
-    print("  Collecting samples for SSIM comparison matrices ...")
+    def _ssim_cell(sheets_i, sheets_j):
+        scores = []
+        for a in sheets_i:
+            for b in sheets_j:
+                drange = max(a.max() - a.min(), b.max() - b.min(), 1e-6)
+                scores.append(ssim(a, b, data_range=drange))
+        return float(np.mean(scores)) if scores else 0.0
 
-    # --- collect n_samples images per class ----------------------------------
+    # Collect n_samples per class
     samples: dict = {cls: [] for cls in range(n_classes)}
     for imgs, lbls in val_loader:
         for cls in range(n_classes):
@@ -703,9 +677,7 @@ def save_ssim_comparison_matrices(
         if all(len(v) >= n_samples for v in samples.values()):
             break
 
-    # --- helper: extract fc1 cortical sheets for a list of images ------------
-    def _get_sheets(model: SimpleNN, img_list: list) -> np.ndarray:
-        """Returns (n, H, W) array of min-max normalised fc1 cortical sheets."""
+    def _get_sheets(model, img_list):
         captured = [None]
         handle = model.fc1.register_forward_hook(
             lambda _m, _i, out: captured.__setitem__(0, out.detach().cpu())
@@ -718,21 +690,17 @@ def save_ssim_comparison_matrices(
                 model(img.to(device))
                 out_sheets.append(_act_to_cortical_sheet(captured[0][0]))
         handle.remove()
-        return np.stack(out_sheets)   # (n, H, W)
+        return np.stack(out_sheets)
 
-    # --- compute all cortical sheets per model/class -------------------------
     all_sheets: dict = {}
     for lbl, mdl in model_items:
         print(f"    fc1 sheets for '{lbl}' ...")
-        all_sheets[lbl] = {
-            cls: _get_sheets(mdl, samples[cls]) for cls in range(n_classes)
-        }
+        all_sheets[lbl] = {cls: _get_sheets(mdl, samples[cls]) for cls in range(n_classes)}
 
-    # --- build SSIM matrices -------------------------------------------------
     matrices: dict = {}
     scores:   dict = {}
     for lbl, _ in model_items:
-        print(f"    SSIM matrix for '{lbl}' ({n_samples}×{n_samples} pairs/cell) ...")
+        print(f"    SSIM matrix for '{lbl}' ...")
         mat = np.zeros((n_classes, n_classes))
         sh  = all_sheets[lbl]
         for i in range(n_classes):
@@ -740,38 +708,25 @@ def save_ssim_comparison_matrices(
                 mat[i, j] = _ssim_cell(sh[i], sh[j])
         matrices[lbl] = mat
 
-        # --- separation index ------------------------------------------------
-        # mean_intra: mean of the 10 diagonal cells (same-class SSIM)
-        # mean_inter: mean of the 90 off-diagonal cells (cross-class SSIM)
-        # std_all:    std of all 100 cells — global spread of the matrix
-        # separation = (mean_intra - mean_inter) / std_all
-        #   ~ how many std deviations the diagonal rises above the cross-class mean
-        #   0 → no discrimination; higher → tighter within-class clustering
-        mask_diag     = np.eye(n_classes, dtype=bool)
-        mean_intra    = mat[mask_diag].mean()
-        mean_inter    = mat[~mask_diag].mean()
-        std_all       = mat.std()
-        separation    = (mean_intra - mean_inter) / (std_all + 1e-12)
-        scores[lbl]   = {
-            "intra":      mean_intra,
-            "inter":      mean_inter,
-            "std_all":    std_all,
-            "separation": separation,
+        mask_diag  = np.eye(n_classes, dtype=bool)
+        mean_intra = mat[mask_diag].mean()
+        mean_inter = mat[~mask_diag].mean()
+        std_all    = mat.std()
+        separation = (mean_intra - mean_inter) / (std_all + 1e-12)
+        scores[lbl] = {
+            "intra": mean_intra, "inter": mean_inter,
+            "std_all": std_all, "separation": separation,
         }
         print(f"      intra={mean_intra:.4f}  inter={mean_inter:.4f}  "
               f"std={std_all:.4f}  separation={separation:.3f}")
 
-    # --- figure: 1 row × n_models panels -------------------------------------
-    CELL    = 1.8
-    fig_w   = n_models * (n_classes * CELL + 1.2) + 0.5
-    fig_h   = n_classes * CELL + 2.8   # room for rotated x labels + title
+    CELL  = 1.8
+    fig_w = len(model_items) * (n_classes * CELL + 1.2) + 0.5
+    fig_h = n_classes * CELL + 2.8
 
-    fig, axes = plt.subplots(1, n_models,
-                             figsize=(fig_w, fig_h),
-                             squeeze=False)
+    fig, axes = plt.subplots(1, len(model_items), figsize=(fig_w, fig_h), squeeze=False)
     axes = axes[0]
 
-    # Shared colour scale
     vmin = min(m.min() for m in matrices.values())
     vmax = max(m.max() for m in matrices.values())
 
@@ -780,11 +735,10 @@ def save_ssim_comparison_matrices(
         mat = matrices[lbl]
         sc  = scores[lbl]
 
-        im = ax.imshow(mat, cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+        im   = ax.imshow(mat, cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, format="%.2f")
         cbar.ax.tick_params(labelsize=7)
 
-        # Cell value annotations
         mid = (vmin + vmax) / 2
         for i in range(n_classes):
             for j in range(n_classes):
@@ -792,14 +746,12 @@ def save_ssim_comparison_matrices(
                 ax.text(j, i, f"{mat[i, j]:.2f}",
                         ha="center", va="center", fontsize=5, color=color)
 
-        # Highlight the diagonal
         for k in range(n_classes):
-            ax.add_patch(
-                plt.Rectangle((k - 0.5, k - 0.5), 1, 1,
-                               fill=False, edgecolor="cyan", linewidth=1.2)
-            )
+            ax.add_patch(plt.Rectangle(
+                (k - 0.5, k - 0.5), 1, 1,
+                fill=False, edgecolor="cyan", linewidth=1.2,
+            ))
 
-        # Class name tick labels
         ax.set_xticks(range(n_classes))
         ax.set_yticks(range(n_classes))
         ax.set_xticklabels(FMNIST_CLASSES, rotation=45, ha="right", fontsize=7)
@@ -808,15 +760,15 @@ def save_ssim_comparison_matrices(
 
         ax.set_title(
             f"{lbl}\n"
-            f"intra = {sc['intra']:.4f}   inter = {sc['inter']:.4f}\n"
-            f"separation = {sc['separation']:.3f}",
+            f"intra={sc['intra']:.4f}  inter={sc['inter']:.4f}\n"
+            f"separation={sc['separation']:.3f}",
             fontsize=9, pad=6,
         )
 
     plt.suptitle(
         "Pairwise Mean SSIM of fc1 Cortical-Sheet Activations\n"
-        f"({n_samples} samples/class  →  {n_samples * n_samples} pairs per cell  "
-        "·  diagonal = intra-class,  off-diagonal = inter-class)\n"
+        f"({n_samples} samples/class  ·  diagonal = intra-class,  "
+        "off-diagonal = inter-class)\n"
         "separation = (mean_intra − mean_inter) / std(all cells)",
         fontsize=10, y=1.01,
     )
@@ -826,22 +778,10 @@ def save_ssim_comparison_matrices(
     plt.close(fig)
     print(f"  Saved SSIM matrix -> {path}")
 
-    # --- save scores to text file --------------------------------------------
     scores_path = out_dir / "ssim_scores.txt"
     with open(scores_path, "w") as f:
         f.write("SSIM Clustering Scores\n")
-        f.write(f"n_samples per class : {n_samples}\n")
-        f.write(f"pairs per cell      : {n_samples * n_samples}\n")
-        f.write(f"n_classes           : {n_classes}\n")
-        f.write("\n")
-        f.write(
-            "Separation index = (mean_intra - mean_inter) / std(all_cells)\n"
-            "  Measures how many std deviations the diagonal (same-class SSIM)\n"
-            "  sits above the off-diagonal mean, relative to the global spread\n"
-            "  of the matrix.  0 = no discrimination; higher = better clustering.\n"
-            "  Note: diagonal cells include self-pairs (SSIM=1) which inflate intra.\n"
-        )
-        f.write("\n")
+        f.write(f"n_samples per class : {n_samples}\n\n")
         col_w = 14
         header = (f"{'Model':<{col_w}}  {'Intra':>8}  {'Inter':>8}  "
                   f"{'Std':>8}  {'Separation':>12}\n")
@@ -852,32 +792,21 @@ def save_ssim_comparison_matrices(
                 f"{lbl:<{col_w}}  {sc['intra']:>8.4f}  {sc['inter']:>8.4f}  "
                 f"{sc['std_all']:>8.4f}  {sc['separation']:>12.3f}\n"
             )
-    print(f"  Saved SSIM scores  -> {scores_path}")
+    print(f"  Saved SSIM scores -> {scores_path}")
 
-    # Print summary table to stdout
     print("\n  SSIM Clustering Scores:")
     print(f"  {'Model':<14}  {'Intra':>8}  {'Inter':>8}  {'Std':>8}  {'Separation':>12}")
     print(f"  {'-'*14}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*12}")
     for lbl, sc in scores.items():
         print(f"  {lbl:<14}  {sc['intra']:>8.4f}  {sc['inter']:>8.4f}  "
-              f"{sc['std_all']:>8.4f}  {sc['separation']:>12.3f}")
+              f"  {sc['std_all']:>8.4f}  {sc['separation']:>12.3f}")
 
 
 def save_comparison_figure(models: dict,
                            val_loader: DataLoader,
                            out_dir: Path,
                            device: str) -> None:
-    """Side-by-side selectivity comparison across all trained models.
-
-    Parameters
-    ----------
-    models : dict mapping label -> SimpleNN, ordered as desired left-to-right,
-             e.g. {"topo": ..., "topo-only": ..., "baseline": ...}
-
-    Layout:
-      Rows = 10 classes
-      Cols = [example | (fc1 | fc2) per model]
-    """
+    """Side-by-side selectivity comparison across all trained models."""
     compare_layers = ["fc1", "fc2"]
     model_items    = list(models.items())
 
@@ -893,7 +822,6 @@ def save_comparison_figure(models: dict,
     n_classes  = len(FMNIST_CLASSES)
     n_cl       = len(compare_layers)
     n_models   = len(model_items)
-    # cols: example | (fc1 fc2) x n_models
     col_labels = (["Example"]
                   + [f"{lbl}/{n}" for lbl, _ in model_items for n in compare_layers])
     n_cols = len(col_labels)
@@ -964,15 +892,7 @@ def save_subset_comparison_figure(
     tag: str,
     subtitle: str = "",
 ) -> None:
-    """Topo vs topo-only selectivity comparison for a subset of classes.
-
-    Parameters
-    ----------
-    models        : dict mapping label -> SimpleNN (typically just topo + topo-only)
-    class_indices : list of FMNIST_CLASSES indices to show as rows
-    tag           : filename suffix, e.g. "tops" -> selectivity_subset_tops.png
-    subtitle      : optional human-readable description for the suptitle
-    """
+    """Selectivity comparison for a subset of FMNIST classes."""
     compare_layers = ["fc1", "fc2"]
     model_items    = list(models.items())
 
@@ -985,9 +905,9 @@ def save_subset_comparison_figure(
         if all_labels is None:
             all_labels = lbls
 
-    n_rows  = len(class_indices)
-    n_cl    = len(compare_layers)
-    n_models = len(model_items)
+    n_rows    = len(class_indices)
+    n_cl      = len(compare_layers)
+    n_models  = len(model_items)
     col_labels = (["Example"]
                   + [f"{lbl}/{n}" for lbl, _ in model_items for n in compare_layers])
     n_cols = len(col_labels)
@@ -1001,7 +921,6 @@ def save_subset_comparison_figure(
     for col, lbl in enumerate(col_labels):
         axes[0, col].set_title(lbl, fontsize=9, pad=3)
 
-    # collect one example image per requested class
     example_imgs = {}
     for imgs, lbls in val_loader:
         for cls in class_indices:
@@ -1054,68 +973,61 @@ def save_subset_comparison_figure(
 # -- Config loading ------------------------------------------------------------
 
 _DEFAULT_CONFIG = {
-    "data_dir":         None,          # null → BASE_DIR/data
-    "output_dir":       None,          # null → BASE_DIR/outputs/train_topo_sparsity
-    "hidden_size":      256,
-    "epochs":           10,
-    "batch_size":       256,
-    "lr":               1e-3,
-    "device":           "cuda:0",
-    "print_freq":       10,
-    "resume_topo":      None,
-    "resume_topo_only": None,
-    "resume_base":      None,
+    "data_dir":             None,
+    "output_dir":           None,
+    "hidden_size":          256,
+    "epochs":               10,
+    "batch_size":           256,
+    "lr":                   1e-3,
+    "device":               "cuda:0",
+    "print_freq":           10,
+    "resume_topo_gl":       None,
+    "resume_topo_kl_ent":   None,
+    "resume_topo_only":     None,
+    "resume_base":          None,
     "layers": {
-        "fc1": {"topo_scale": 10.0, "factor_h": 4.0, "factor_w": 4.0,
-                "lambda_kl": 1.0, "lambda_entropy": 1.0, "temperature": 3.0},
+        "fc1": {
+            "topo_scale":    10.0,
+            "factor_h":       4.0,
+            "factor_w":       4.0,
+            "lambda_gl":      1.0,   # group-lasso weight
+            "lambda_kl":      0.0,
+            "lambda_entropy": 1.0,
+            "temperature":    3.0,   # used only for KL/entropy variant
+        },
     },
 }
 
 
 def get_config():
-    """Load config from JSON file, then apply any CLI overrides.
-
-    Usage
-    -----
-    python train_topo_sparsity.py --config configs/train_topo_sparsity.json
-
-    Any top-level key can be overridden via CLI:
-      --epochs 50  --device cuda:1  --data-dir /path/to/data  etc.
-
-    Per-layer settings (topo_scale, factor_h, factor_w, lambda_kl,
-    lambda_entropy) must be edited in the JSON file.
-    """
     p = argparse.ArgumentParser(
-        description="Train SimpleNN with topographic regularisation on Fashion-MNIST.\n"
-                    "All hyperparameters live in a JSON config file; top-level\n"
-                    "keys can be overridden via CLI arguments."
+        description=(
+            "Train SimpleNN with TopoLoss + Group-Lasso on Fashion-MNIST.\n"
+            "Four variants are trained: topo_gl | topo_kl_ent | topo_only | baseline."
+        )
     )
-    default_cfg = str(BASE_DIR / "configs" / "train_topo_sparsity.json")
-    p.add_argument("--config",           type=str, default=default_cfg,
-                   help="Path to JSON config file")
-    # top-level CLI overrides (all optional — None means 'use JSON value')
-    p.add_argument("--data-dir",         type=str,   default=None)
-    p.add_argument("--output-dir",       type=str,   default=None)
-    p.add_argument("--hidden-size",      type=int,   default=None)
-    p.add_argument("--epochs",           type=int,   default=None)
-    p.add_argument("--batch-size",       type=int,   default=None)
-    p.add_argument("--lr",               type=float, default=None)
-    p.add_argument("--device",           type=str,   default=None)
-    p.add_argument("--print-freq",       type=int,   default=None)
-    p.add_argument("--resume-topo",      type=str,   default=None)
-    p.add_argument("--resume-topo-only", type=str,   default=None)
-    p.add_argument("--resume-base",      type=str,   default=None)
+    default_cfg = str(BASE_DIR / "configs" / "train_topo_group_lasso.json")
+    p.add_argument("--config",                type=str, default=default_cfg)
+    p.add_argument("--data-dir",              type=str, default=None)
+    p.add_argument("--output-dir",            type=str, default=None)
+    p.add_argument("--hidden-size",           type=int, default=None)
+    p.add_argument("--epochs",                type=int, default=None)
+    p.add_argument("--batch-size",            type=int, default=None)
+    p.add_argument("--lr",                    type=float, default=None)
+    p.add_argument("--device",                type=str, default=None)
+    p.add_argument("--print-freq",            type=int, default=None)
+    p.add_argument("--resume-topo-gl",        type=str, default=None)
+    p.add_argument("--resume-topo-kl-ent",    type=str, default=None)
+    p.add_argument("--resume-topo-only",      type=str, default=None)
+    p.add_argument("--resume-base",           type=str, default=None)
     cli = p.parse_args()
 
-    # Start from built-in defaults, overlay JSON file, then overlay CLI
-    import copy as _copy
-    cfg = _copy.deepcopy(_DEFAULT_CONFIG)
+    cfg = copy.deepcopy(_DEFAULT_CONFIG)
 
     cfg_path = Path(cli.config)
     if cfg_path.exists():
         with open(cfg_path) as fh:
             file_cfg = json.load(fh)
-        # deep-merge layers sub-dict
         for key, val in file_cfg.items():
             if key == "layers" and isinstance(val, dict):
                 for lname, lvals in val.items():
@@ -1123,31 +1035,30 @@ def get_config():
                         cfg["layers"][lname].update(lvals)
                     else:
                         cfg["layers"][lname] = lvals
-            else:
+            elif key not in ("_comment",):
                 cfg[key] = val
         print(f"Config loaded from: {cfg_path}")
     else:
         print(f"Config file not found ({cfg_path}), using built-in defaults.")
 
-    # CLI overrides (argparse uses underscores, JSON uses underscores too)
     cli_map = {
-        "data_dir":         cli.data_dir,
-        "output_dir":       cli.output_dir,
-        "hidden_size":      cli.hidden_size,
-        "epochs":           cli.epochs,
-        "batch_size":       cli.batch_size,
-        "lr":               cli.lr,
-        "device":           cli.device,
-        "print_freq":       cli.print_freq,
-        "resume_topo":      cli.resume_topo,
-        "resume_topo_only": cli.resume_topo_only,
-        "resume_base":      cli.resume_base,
+        "data_dir":           cli.data_dir,
+        "output_dir":         cli.output_dir,
+        "hidden_size":        cli.hidden_size,
+        "epochs":             cli.epochs,
+        "batch_size":         cli.batch_size,
+        "lr":                 cli.lr,
+        "device":             cli.device,
+        "print_freq":         cli.print_freq,
+        "resume_topo_gl":     cli.resume_topo_gl,
+        "resume_topo_kl_ent": cli.resume_topo_kl_ent,
+        "resume_topo_only":   cli.resume_topo_only,
+        "resume_base":        cli.resume_base,
     }
     for key, val in cli_map.items():
         if val is not None:
             cfg[key] = val
 
-    # Fill in path defaults
     if cfg["data_dir"]   is None:
         cfg["data_dir"]   = str(BASE_DIR / "data")
     if cfg["output_dir"] is None:
@@ -1169,12 +1080,20 @@ def run_training(
     ckpt_dir: Path,
     device: str,
     print_freq: int,
-    topo_loss=None,          # None => baseline (CE only)
-    layer_cfg: dict = None,  # {layer_name: {factor_h, factor_w, lambda_kl, lambda_entropy}}
+    topo_loss=None,
+    layer_cfg: dict = None,
     start_epoch: int = 0,
     best_acc: float = 0.0,
 ) -> SimpleNN:
-    """Train one model; return the model with best-checkpoint weights loaded."""
+    """Train one model; return the model with best-checkpoint weights loaded.
+
+    ``layer_cfg`` entry keys used here:
+        factor_h, factor_w   – cortical-sheet downsampling factors
+        lambda_gl            – group-lasso weight  (0 to disable)
+        lambda_kl            – KL-from-uniform weight (0 to disable)
+        lambda_entropy       – entropy penalty weight (0 to disable)
+        temperature          – softmax temperature for KL/entropy
+    """
 
     act_store: dict = {name: None for name in TOPO_LAYER_NAMES}
     hook_handles    = []
@@ -1190,6 +1109,7 @@ def run_training(
     for epoch in range(start_epoch, epochs):
         model.train()
         sum_ce = sum_topo = 0.0
+        sum_gl  = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_kl  = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_ent = {n: 0.0 for n in TOPO_LAYER_NAMES}
         n_correct = n_total = 0
@@ -1208,16 +1128,26 @@ def run_training(
                 for name in TOPO_LAYER_NAMES:
                     act = act_store[name]
                     if act is not None:
-                        lc  = layer_cfg[name]
-                        kl, ent = cortical_sparsity_losses(
-                            act, lc["factor_h"], lc["factor_w"],
-                            lc.get("temperature", 3.0)
-                        )
-                        extra = (extra
-                                 + lc["lambda_kl"]      * kl
-                                 + lc["lambda_entropy"] * ent)
-                        sum_kl[name]  += kl.item()  * imgs.size(0)
-                        sum_ent[name] += ent.item() * imgs.size(0)
+                        lc = layer_cfg[name]
+
+                        # Group-lasso
+                        lgl = lc.get("lambda_gl", 0.0)
+                        if lgl != 0.0:
+                            gl = group_lasso_loss(act, lc["factor_h"], lc["factor_w"])
+                            extra = extra + lgl * gl
+                            sum_gl[name] += gl.item() * imgs.size(0)
+
+                        # KL + entropy
+                        lkl  = lc.get("lambda_kl",      0.0)
+                        lent = lc.get("lambda_entropy",  0.0)
+                        if lkl != 0.0 or lent != 0.0:
+                            kl, ent = cortical_sparsity_losses(
+                                act, lc["factor_h"], lc["factor_w"],
+                                lc.get("temperature", 3.0),
+                            )
+                            extra = extra + lkl * kl + lent * ent
+                            sum_kl[name]  += kl.item()  * imgs.size(0)
+                            sum_ent[name] += ent.item() * imgs.size(0)
 
             loss = ce + extra
             optimizer.zero_grad()
@@ -1245,13 +1175,15 @@ def run_training(
         if (epoch + 1) % print_freq == 0 or epoch == epochs - 1:
             n = n_total
             if topo_loss is not None:
-                kl_str  = "  ".join(f"{nm}:{sum_kl[nm]/n:.3f}"  for nm in TOPO_LAYER_NAMES)
-                ent_str = "  ".join(f"{nm}:{sum_ent[nm]/n:.3f}" for nm in TOPO_LAYER_NAMES)
+                gl_str  = "  ".join(f"{nm}:{sum_gl[nm]/n:.4f}"  for nm in TOPO_LAYER_NAMES)
+                kl_str  = "  ".join(f"{nm}:{sum_kl[nm]/n:.4f}"  for nm in TOPO_LAYER_NAMES)
+                ent_str = "  ".join(f"{nm}:{sum_ent[nm]/n:.4f}" for nm in TOPO_LAYER_NAMES)
                 print(
                     f"[{label}] Epoch [{epoch+1:3d}/{epochs}]  "
                     f"CE={sum_ce/n:.4f}  "
                     f"\033[93mTopo={sum_topo/n:.6f}\033[0m  "
                     f"Train={train_acc:.1f}%  \033[92mVal={val_acc:.1f}%\033[0m\n"
+                    f"  GL  [{gl_str}]\n"
                     f"  KL  [{kl_str}]\n"
                     f"  Ent [{ent_str}]"
                 )
@@ -1282,8 +1214,6 @@ def run_training(
         h.remove()
 
     print(f"\n[{label}] Training complete.  Best val acc: {best_acc:.1f}%")
-
-    # Load best weights before returning
     best_ckpt = torch.load(ckpt_dir / f"best_{label}.pt", map_location=device)
     model.load_state_dict(best_ckpt["model"])
     return model
@@ -1304,7 +1234,6 @@ def _build_topo_loss(model: SimpleNN, layer_cfg: dict) -> TopoLoss:
 
 
 def train(cfg: dict):
-    # Print resolved config
     print("=" * 65)
     print("  EFFECTIVE CONFIG")
     print("=" * 65)
@@ -1324,6 +1253,7 @@ def train(cfg: dict):
     else:
         device = "cpu"
     print(f"Using device: {device}")
+
     out_dir  = Path(cfg["output_dir"])
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1341,39 +1271,76 @@ def train(cfg: dict):
                               num_workers=0, pin_memory=_pin)
     print(f"Dataset: {len(train_ds):,} train | {len(val_ds):,} val | 10 classes\n")
 
-    layer_cfg = cfg["layers"]  # shorthand
+    layer_cfg = cfg["layers"]
+    criterion = nn.CrossEntropyLoss().to(device)
 
-    # ── Topo model (TopoLoss + KL + entropy sparsity) ───────────────────────
+    # ── topo_gl model  (TopoLoss + Group-Lasso, KL/entropy zeroed) ─────────
     print("=" * 65)
-    print("  TOPO MODEL  (TopoLoss + sparsity on fc1)")
+    print("  TOPO_GL MODEL  (TopoLoss + Group-Lasso on fc1)")
     print("=" * 65)
-    topo_model = SimpleNN(hidden_size=cfg.get("hidden_size", 256)).to(device)
-    topo_optim = optim.Adam(topo_model.parameters(), lr=cfg["lr"])
-    topo_start, topo_best = 0, 0.0
+    topo_gl_model = SimpleNN(hidden_size=cfg.get("hidden_size", 256)).to(device)
+    topo_gl_optim = optim.Adam(topo_gl_model.parameters(), lr=cfg["lr"])
+    topo_gl_start, topo_gl_best = 0, 0.0
 
-    if cfg.get("resume_topo"):
-        ckpt = torch.load(cfg["resume_topo"], map_location=device)
-        topo_model.load_state_dict(ckpt["model"])
-        topo_optim.load_state_dict(ckpt["optimizer"])
-        topo_start = ckpt["epoch"] + 1
-        topo_best  = ckpt.get("best_acc", 0.0)
-        print(f"  Resumed from epoch {topo_start}")
+    if cfg.get("resume_topo_gl"):
+        ckpt = torch.load(cfg["resume_topo_gl"], map_location=device)
+        topo_gl_model.load_state_dict(ckpt["model"])
+        topo_gl_optim.load_state_dict(ckpt["optimizer"])
+        topo_gl_start = ckpt["epoch"] + 1
+        topo_gl_best  = ckpt.get("best_acc", 0.0)
+        print(f"  Resumed from epoch {topo_gl_start}")
 
-    criterion  = nn.CrossEntropyLoss().to(device)
-    topo_model = run_training(
-        label="topo",
-        model=topo_model, train_loader=train_loader, val_loader=val_loader,
-        criterion=criterion, optimizer=topo_optim,
+    # Keep only group-lasso; zero out KL and entropy for this variant
+    gl_layer_cfg = {
+        name: {**vals, "lambda_kl": 0.0, "lambda_entropy": 0.0}
+        for name, vals in layer_cfg.items()
+    }
+    topo_gl_model = run_training(
+        label="topo_gl",
+        model=topo_gl_model, train_loader=train_loader, val_loader=val_loader,
+        criterion=criterion, optimizer=topo_gl_optim,
         epochs=cfg["epochs"], ckpt_dir=ckpt_dir, device=device,
         print_freq=cfg["print_freq"],
-        topo_loss=_build_topo_loss(topo_model, layer_cfg),
-        layer_cfg=layer_cfg,
-        start_epoch=topo_start, best_acc=topo_best,
+        topo_loss=_build_topo_loss(topo_gl_model, layer_cfg),
+        layer_cfg=gl_layer_cfg,
+        start_epoch=topo_gl_start, best_acc=topo_gl_best,
     )
 
-    # ── Topo-only model (TopoLoss, no sparsity) ──────────────────────────────
+    # ── topo_kl_ent model  (TopoLoss + KL + Entropy, group-lasso zeroed) ───
     print("\n" + "=" * 65)
-    print("  TOPO-ONLY MODEL  (TopoLoss only on fc1, no KL/entropy sparsity)")
+    print("  TOPO_KL_ENT MODEL  (TopoLoss + KL/Entropy on fc1)")
+    print("=" * 65)
+    topo_kl_ent_model = SimpleNN(hidden_size=cfg.get("hidden_size", 256)).to(device)
+    topo_kl_ent_optim = optim.Adam(topo_kl_ent_model.parameters(), lr=cfg["lr"])
+    topo_kl_ent_start, topo_kl_ent_best = 0, 0.0
+
+    if cfg.get("resume_topo_kl_ent"):
+        ckpt = torch.load(cfg["resume_topo_kl_ent"], map_location=device)
+        topo_kl_ent_model.load_state_dict(ckpt["model"])
+        topo_kl_ent_optim.load_state_dict(ckpt["optimizer"])
+        topo_kl_ent_start = ckpt["epoch"] + 1
+        topo_kl_ent_best  = ckpt.get("best_acc", 0.0)
+        print(f"  Resumed from epoch {topo_kl_ent_start}")
+
+    # Keep only KL/entropy; zero out group lasso for this variant
+    kl_ent_layer_cfg = {
+        name: {**vals, "lambda_gl": 0.0}
+        for name, vals in layer_cfg.items()
+    }
+    topo_kl_ent_model = run_training(
+        label="topo_kl_ent",
+        model=topo_kl_ent_model, train_loader=train_loader, val_loader=val_loader,
+        criterion=criterion, optimizer=topo_kl_ent_optim,
+        epochs=cfg["epochs"], ckpt_dir=ckpt_dir, device=device,
+        print_freq=cfg["print_freq"],
+        topo_loss=_build_topo_loss(topo_kl_ent_model, layer_cfg),
+        layer_cfg=kl_ent_layer_cfg,
+        start_epoch=topo_kl_ent_start, best_acc=topo_kl_ent_best,
+    )
+
+    # ── topo_only model  (TopoLoss only, all sparsity zeroed) ───────────────
+    print("\n" + "=" * 65)
+    print("  TOPO_ONLY MODEL  (TopoLoss only on fc1, no sparsity)")
     print("=" * 65)
     topo_only_model = SimpleNN(hidden_size=cfg.get("hidden_size", 256)).to(device)
     topo_only_optim = optim.Adam(topo_only_model.parameters(), lr=cfg["lr"])
@@ -1387,10 +1354,8 @@ def train(cfg: dict):
         topo_only_best  = ckpt.get("best_acc", 0.0)
         print(f"  Resumed from epoch {topo_only_start}")
 
-    # zero-out lambda_kl / lambda_entropy for the topo-only variant
-    import copy as _copy
     topo_only_layer_cfg = {
-        name: {**vals, "lambda_kl": 0.0, "lambda_entropy": 0.0}
+        name: {**vals, "lambda_gl": 0.0, "lambda_kl": 0.0, "lambda_entropy": 0.0}
         for name, vals in layer_cfg.items()
     }
     topo_only_model = run_training(
@@ -1400,11 +1365,11 @@ def train(cfg: dict):
         epochs=cfg["epochs"], ckpt_dir=ckpt_dir, device=device,
         print_freq=cfg["print_freq"],
         topo_loss=_build_topo_loss(topo_only_model, layer_cfg),
-        layer_cfg=topo_only_layer_cfg,    # lambdas zeroed
+        layer_cfg=topo_only_layer_cfg,
         start_epoch=topo_only_start, best_acc=topo_only_best,
     )
 
-    # ── Baseline model (CE only) ─────────────────────────────────────────────
+    # ── baseline model  (CE only) ────────────────────────────────────────────
     print("\n" + "=" * 65)
     print("  BASELINE MODEL  (CE only, no TopoLoss, no sparsity)")
     print("=" * 65)
@@ -1426,22 +1391,21 @@ def train(cfg: dict):
         criterion=criterion, optimizer=base_optim,
         epochs=cfg["epochs"], ckpt_dir=ckpt_dir, device=device,
         print_freq=cfg["print_freq"],
-        topo_loss=None,    # CE only — layer_cfg unused when topo_loss is None
+        topo_loss=None,
         start_epoch=base_start, best_acc=base_best,
     )
 
     print(f"\nTraining complete.  Checkpoints saved to: {ckpt_dir}")
-    print("  Run  examples/test/test_topo_sparsity.py  to generate evaluation figures.")
+    print("  Run  src/test/test_topo_group_lasso.py  to generate evaluation figures.")
 
 
 if __name__ == "__main__":
     cfg = get_config()
 
-    # Ensure logs directory exists and tee stdout/stderr to file + console
     log_dir = BASE_DIR / "outputs" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_path = log_dir / f"train_topo_sparsity-{ts}.txt"
+    log_path = log_dir / f"train_topo_group_lasso-{ts}.txt"
 
     class _Tee:
         def __init__(self, *streams):

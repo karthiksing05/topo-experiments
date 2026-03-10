@@ -47,7 +47,7 @@ echo "=========================================="
 cd "$EXPERIMENT_DIR"
 mkdir -p "${HF_CACHE_DIR}"
 
-srun python -u examples/test/test_topo_load.py
+srun python -u src/test/test_topo_load.py
 
 echo ""
 echo "=========================================="

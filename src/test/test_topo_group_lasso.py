@@ -11,9 +11,9 @@ outputs/train_topo_group_lasso/:
 
 Usage
 -----
-python examples/test/test_topo_group_lasso.py
-python examples/test/test_topo_group_lasso.py --config configs/train_topo_group_lasso.json
-python examples/test/test_topo_group_lasso.py \\
+python src/test/test_topo_group_lasso.py
+python src/test/test_topo_group_lasso.py --config configs/train_topo_group_lasso.json
+python src/test/test_topo_group_lasso.py \\
     --checkpoint-topo-gl      outputs/train_topo_group_lasso/checkpoints/best_topo_gl.pt \\
     --checkpoint-topo-kl-ent  outputs/train_topo_group_lasso/checkpoints/best_topo_kl_ent.pt \\
     --checkpoint-topo-only    outputs/train_topo_group_lasso/checkpoints/best_topo_only.pt \\
@@ -205,7 +205,7 @@ def evaluate(cfg: dict) -> None:
             return candidate
         raise FileNotFoundError(
             f"Checkpoint not found: {candidate}.\n"
-            f"Train the model first (examples/train/train_topo_group_lasso.py) or "
+            f"Train the model first (src/train/train_topo_group_lasso.py) or "
             f"supply --{cfg_key.replace('_', '-')}."
         )
 
