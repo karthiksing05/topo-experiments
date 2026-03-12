@@ -21,8 +21,8 @@ sys.path.insert(0, str(_THIS_DIR))
 sys.path.insert(0, str(_THIS_DIR.parent / "imagenet"))  # resnet_imagenet_common
 from stl_cifar_common import (
     BASE_DIR, load_config, build_model,
-    make_stl_loaders, make_cifar_overlap_loaders,
-    run_pretrain, run_finetune, save_results, evaluate,
+    make_stl_loaders, make_cifar_overlap_loaders, _CIFAR_TO_STL,
+    run_pretrain, run_finetune, save_results, evaluate, evaluate_per_class,
 )
 from resnet_imagenet_common import get_residual_convs, build_topo_loss
 
@@ -76,7 +76,8 @@ def train(cfg: dict) -> None:
     )
     print("Loading CIFAR-10 (overlap classes only) …")
     cifar_train, cifar_val = make_cifar_overlap_loaders(
-        data_dir, cfg["batch_size"], cfg["num_workers"], cfg["img_size"]
+        data_dir, cfg["batch_size"], cfg["num_workers"], cfg["img_size"],
+        subset_classes=cfg.get("finetune_cifar_classes"),
     )
 
     # ---- Model + TopoLoss ---------------------------------------------------
@@ -102,6 +103,7 @@ def train(cfg: dict) -> None:
     print(f"\nPhase 1 complete. Best STL-10 Val: {best_stl_acc:.2f}%")
 
     stl_acc_before = evaluate(model, stl_val, device)
+    stl_per_class_before = evaluate_per_class(model, stl_val, device, n_classes=10)
     print(f"STL-10 accuracy before finetune: {stl_acc_before:.2f}%")
 
     # ---- Phase 2 ------------------------------------------------------------
@@ -114,6 +116,7 @@ def train(cfg: dict) -> None:
         topo_loss=topo_loss, residual_convs=residual_convs,
         layer_cfg=layer_cfg, default_layer_cfg=default_lc,
     )
+    stl_per_class_after = evaluate_per_class(model, stl_val, device, n_classes=10)
 
     forgetting = stl_acc_before - stl_acc_after
     print(f"\n── Results ({LABEL}) ───────────────────────────────────────────────")
@@ -127,6 +130,8 @@ def train(cfg: dict) -> None:
         "stl_acc_before":   stl_acc_before,
         "cifar_acc_after":  cifar_acc,
         "stl_acc_after":    stl_acc_after,
+        "stl_per_class_acc_before": stl_per_class_before,
+        "stl_per_class_acc_after":  stl_per_class_after,
         "forgetting":       forgetting,
         "best_stl_acc":     best_stl_acc,
         "stl_acc_per_epoch":      stl_acc_history,
@@ -138,12 +143,18 @@ def train(cfg: dict) -> None:
         "pretrain_grad_entropy_per_epoch": pretrain_losses["grad_entropy"],
         "pretrain_kl_per_epoch":           pretrain_losses["kl"],
         "pretrain_sparse_per_epoch":       pretrain_losses["sparse"],
+        "pretrain_sparse_kl_per_epoch":    pretrain_losses["sparse_kl"],
         "ft_ce_per_epoch":                 ft_losses["ce"],
         "ft_topo_per_epoch":               ft_losses["topo"],
         "ft_entropy_per_epoch":            ft_losses["entropy"],
         "ft_grad_entropy_per_epoch":       ft_losses["grad_entropy"],
         "ft_kl_per_epoch":                 ft_losses["kl"],
         "ft_sparse_per_epoch":             ft_losses["sparse"],
+        "ft_sparse_kl_per_epoch":          ft_losses["sparse_kl"],
+        "finetuned_stl_classes":  sorted(
+            _CIFAR_TO_STL[c] for c in (cfg.get("finetune_cifar_classes") or list(_CIFAR_TO_STL))
+            if c in _CIFAR_TO_STL
+        ),
         "config": {k: v for k, v in cfg.items() if k not in {"layers", "default_layer_cfg"}},
     }
     save_results(results, out_dir / "results", LABEL)

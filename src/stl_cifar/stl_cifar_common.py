@@ -182,6 +182,7 @@ def make_cifar_overlap_loaders(
     batch_size: int = 128,
     num_workers: int = 4,
     img_size: int = 96,
+    subset_classes: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """CIFAR-10 loaders filtered to STL-10-overlapping classes.
 
@@ -189,7 +190,18 @@ def make_cifar_overlap_loaders(
     model trained on STL-10 can be fine-tuned without a head swap.
     CIFAR frog (label 6) is excluded; CIFAR automobile (label 1) is
     mapped to STL car (label 2).
+
+    Args:
+        subset_classes: optional list of CIFAR-10 class indices to include.
+            Must be a subset of the keys in _CIFAR_TO_STL.  When None, all
+            9 overlapping classes are used.
     """
+    # Build the label map for this run (possibly a subset)
+    if subset_classes is not None:
+        label_map = {c: _CIFAR_TO_STL[c] for c in subset_classes if c in _CIFAR_TO_STL}
+    else:
+        label_map = _CIFAR_TO_STL
+
     train_tf = T.Compose([
         T.Resize(img_size),
         T.RandomHorizontalFlip(),
@@ -214,17 +226,19 @@ def make_cifar_overlap_loaders(
     def _filter(ds):
         indices = [
             i for i, lbl in enumerate(ds.targets)
-            if lbl in _CIFAR_TO_STL
+            if lbl in label_map
         ]
-        return _RemappedSubset(ds, indices, _CIFAR_TO_STL)
+        return _RemappedSubset(ds, indices, label_map)
 
     train_sub = _filter(train_ds)
     val_sub   = _filter(val_ds)
 
+    finetuned_stl = sorted(label_map.values())
     print(
         f"  CIFAR-10 overlap subset: "
         f"train {len(train_sub):,} / val {len(val_sub):,} samples "
-        f"({len(_CIFAR_TO_STL)} of 10 classes, labels remapped to STL-10 space)"
+        f"({len(label_map)} of 10 classes, labels remapped to STL-10 space)\n"
+        f"  Finetuned STL-10 classes: {finetuned_stl}"
     )
 
     train_loader = DataLoader(
@@ -314,6 +328,49 @@ def cortical_l1_entropy_loss(
     return entropy.mean()
 
 
+def cortical_l1_batch_diversity_loss(
+    activations: torch.Tensor,
+    factor_h: float,
+    factor_w: float,
+) -> torch.Tensor:
+    """Batch-level diversity penalty complementary to cortical_l1_entropy_loss.
+
+    Each instance is L1-normalised so that its magnitudes form a probability
+    mass over the cortical sheet.  The *batch-mean* of these per-instance
+    distributions is then compared to the uniform distribution via KL
+    divergence.  Minimising this encourages different instances within a
+    batch to activate *different* parts of the sheet, preventing the
+    collapse to a single always-active patch that pure per-instance sparsity
+    can cause.
+
+    Intuitively: per-instance sparsity + batch-mean near uniform =
+    sparse but spread-out, category-specific activations.
+
+    Returns
+    -------
+    scalar tensor — KL(uniform ‖ batch-mean L1 distribution).
+    """
+    if activations.ndim == 4:
+        activations = activations.mean(dim=(2, 3))
+    B, N = activations.shape
+    size = find_cortical_sheet_size(N)
+    H, W = size.height, size.width
+    sheet = activations[:, : H * W].reshape(B, 1, H, W)
+    H_d = max(1, round(H / factor_h))
+    W_d = max(1, round(W / factor_w))
+    flat = F.adaptive_avg_pool2d(sheet, (H_d, W_d)).reshape(B, -1)  # (B, M)
+    mags = flat.abs()                                                # (B, M)
+    norm = mags.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    p    = mags / norm                                               # (B, M) — per-instance L1 dist
+    batch_mean = p.mean(dim=0)                                       # (M,)
+    M = batch_mean.shape[0]
+    # KL(uniform || batch_mean)  =  log(M) - H(batch_mean)
+    # We want batch_mean close to uniform, so minimise this.
+    log_uniform = math.log(M)
+    kl = log_uniform + (batch_mean * (batch_mean + 1e-10).log()).sum()
+    return kl
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -334,7 +391,7 @@ def _make_optimizer(model: nn.Module, lr: float, weight_decay: float):
     return opt
 
 
-def _grad_entropy(model: nn.Module) -> float:
+def _grad_entropy(model: nn.Module, params=None) -> float:
     """Mean normalised Shannon entropy of gradient magnitudes across all layers.
 
     For each parameter tensor that has a gradient, we treat |grad| as an
@@ -345,9 +402,17 @@ def _grad_entropy(model: nn.Module) -> float:
     Interpretation:
       1.0  — perfectly uniform gradient (every weight pulled equally)
       0.0  — all gradient mass concentrated on one weight
+
+    Parameters
+    ----------
+    model  : the model whose parameters() are iterated by default
+    params : optional explicit iterable of tensors to measure instead;
+             pass e.g. [conv.weight for conv in cortical_convs.values()] to
+             get a cortical-sheet-only entropy that isn't diluted by the
+             many unmasked backbone layers.
     """
     entropies: list[float] = []
-    for p in model.parameters():
+    for p in (params if params is not None else model.parameters()):
         if p.grad is None:
             continue
         g = p.grad.detach().float().abs().view(-1)
@@ -379,6 +444,102 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str) -> float:
     return 100.0 * correct / total
 
 
+def evaluate_per_class(
+    model: nn.Module, loader: DataLoader, device: str, n_classes: int = 10
+) -> dict:
+    """Return per-class top-1 accuracy (%) on *loader* as {class_idx: acc}."""
+    model.eval()
+    correct = [0] * n_classes
+    total   = [0] * n_classes
+    for imgs, labels in loader:
+        imgs   = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        preds  = model(imgs).argmax(1)
+        for c in range(n_classes):
+            mask = labels == c
+            correct[c] += (preds[mask] == c).sum().item()
+            total[c]   += mask.sum().item()
+    model.train()
+    return {
+        c: (100.0 * correct[c] / total[c] if total[c] > 0 else float("nan"))
+        for c in range(n_classes)
+    }
+
+
+def make_gradsurg_hook(
+    conv: nn.Conv2d,
+    factor_h: float,
+    factor_w: float,
+    percentile: float = 75.0,
+):
+    """Return a weight-gradient backward hook implementing gradient surgery.
+
+    Designed for cortical-sheet conv layers whose C_out dimension represents
+    the spatial cortical sheet (H_c × W_c).
+
+    For each backward pass:
+      1. Compute the per-unit Frobenius norm of the gradient slice for each
+         cortical unit: ``unit_norm[i] = ||G[i, :, :, :]||_F``.
+      2. Reshape to a spatial map ``(1, 1, H_c, W_c)`` and apply topo-style
+         spatial smoothing — adaptive avg_pool2d down by (factor_h, factor_w),
+         then bilinear upsample back.  This collapses diffuse scattered gradient
+         signals into spatially coherent regional blobs.
+      3. Threshold the smoothed map at the *percentile*-th quantile and form a
+         binary mask — units below the threshold are zeroed out.
+      4. Gate the full gradient tensor by this per-unit mask, so only the
+         cortical patch that responded strongly to the current input accumulates
+         a weight update.
+
+    The net effect: regions of the cortical sheet organised for STL-exclusive
+    classes (e.g. monkey) are never reactive to CIFAR-10 inputs, receive a
+    near-zero smoothed norm, and therefore accumulate a zero gradient mask
+    across the entire finetuning run — preserving STL-10 knowledge there
+    without any explicit penalty, Fisher computation, or weight anchoring.
+
+    Returns
+    -------
+    A callable suitable for ``conv.weight.register_hook``.
+    """
+    C_out = conv.weight.shape[0]
+    size  = find_cortical_sheet_size(C_out)
+    H_c, W_c = size.height, size.width
+    H_d = max(1, round(H_c / factor_h))
+    W_d = max(1, round(W_c / factor_w))
+    sheet_units = H_c * W_c  # may be ≤ C_out
+
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
+        # grad: (C_out, C_in, K, K)
+        # Per-unit gradient L2 norm → cortical map (1, 1, H_c, W_c)
+        unit_norms = (
+            grad[:sheet_units]
+            .reshape(sheet_units, -1)
+            .norm(dim=1)              # (sheet_units,)
+        )
+        cmap = unit_norms.reshape(1, 1, H_c, W_c).detach()
+
+        # Topo-smooth: spatial downsample then bilinear upsample
+        cmap_d = F.adaptive_avg_pool2d(cmap, (H_d, W_d))
+        cmap_s = F.interpolate(cmap_d, size=(H_c, W_c),
+                               mode="bilinear", align_corners=False)
+
+        # Percentile threshold → per-unit binary mask
+        flat   = cmap_s.reshape(-1)
+        thresh = flat.quantile(percentile / 100.0) if flat.numel() > 1 else flat.min()
+        mask   = (cmap_s >= thresh).reshape(H_c * W_c)   # (sheet_units,)
+
+        # Expand to (C_out, 1, 1, 1); units beyond sheet_units keep gradient
+        if C_out > sheet_units:
+            tail = torch.ones(C_out - sheet_units,
+                              device=grad.device, dtype=grad.dtype)
+            unit_mask = torch.cat([mask.to(grad.dtype), tail])
+        else:
+            unit_mask = mask[:C_out].to(grad.dtype)
+
+        return grad * unit_mask.reshape(C_out, 1, 1, 1)
+
+    return _hook
+
+
 def _train_one_epoch(
     label: str,
     epoch: int,
@@ -397,10 +558,10 @@ def _train_one_epoch(
     layer_cfg: dict,
     default_layer_cfg: dict,
     print_freq: int,
-) -> tuple[float, float, float, float, float, float]:
-    """Run one epoch; return (ce_avg, topo_avg, entropy_avg, kl_avg, sparse_avg, grad_entropy_avg)."""
+) -> tuple[float, float, float, float, float, float, float]:
+    """Run one epoch; return (ce_avg, topo_avg, entropy_avg, kl_avg, sparse_avg, sparse_kl_avg, grad_entropy_avg)."""
     train_model.train()
-    sum_ce = sum_topo = sum_entropy = sum_kl = sum_sparse = sum_grad_entropy = 0.0
+    sum_ce = sum_topo = sum_entropy = sum_kl = sum_sparse = sum_sparse_kl = sum_grad_entropy = 0.0
     n_steps = 0
     n_total = 0
     primary = torch.device(device)
@@ -446,6 +607,13 @@ def _train_one_epoch(
                             )
                             extra       = extra + lam_sparse * sparse_val
                             sum_sparse += sparse_val.item() * imgs.size(0)
+                        lam_sparse_kl = lc.get("lambda_sparse_kl", 0.0)
+                        if lam_sparse_kl > 0.0:
+                            div_val = cortical_l1_batch_diversity_loss(
+                                act, lc["factor_h"], lc["factor_w"],
+                            )
+                            extra        = extra + lam_sparse_kl * div_val
+                            sum_sparse_kl += div_val.item() * imgs.size(0)
 
             loss = ce + extra
 
@@ -474,11 +642,12 @@ def _train_one_epoch(
                 f"Ent={sum_entropy/n_total:.5f}  "
                 f"KL={sum_kl/n_total:.5f}  "
                 f"Sparse={sum_sparse/n_total:.5f}  "
+                f"SparseKL={sum_sparse_kl/n_total:.5f}  "
                 f"GradH={sum_grad_entropy/max(n_steps,1):.4f}"
             )
 
     grad_ent_avg = sum_grad_entropy / max(n_steps, 1)
-    return sum_ce / n_total, sum_topo / n_total, sum_entropy / n_total, sum_kl / n_total, sum_sparse / n_total, grad_ent_avg
+    return sum_ce / n_total, sum_topo / n_total, sum_entropy / n_total, sum_kl / n_total, sum_sparse / n_total, sum_sparse_kl / n_total, grad_ent_avg
 
 
 def run_pretrain(
@@ -548,11 +717,12 @@ def run_pretrain(
     ent_history:      list[float] = []
     kl_history:       list[float] = []
     sparse_history:   list[float] = []
+    sparse_kl_history: list[float] = []
     grad_ent_history: list[float] = []
 
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
-        ce_avg, topo_avg, ent_avg, kl_avg, sparse_avg, grad_ent_avg = _train_one_epoch(
+        ce_avg, topo_avg, ent_avg, kl_avg, sparse_avg, sparse_kl_avg, grad_ent_avg = _train_one_epoch(
             label=label, epoch=epoch, total_epochs=epochs, phase="STL",
             train_model=train_model, base_model=base_model,
             loader=train_loader, criterion=criterion,
@@ -571,13 +741,14 @@ def run_pretrain(
         ent_history.append(ent_avg)
         kl_history.append(kl_avg)
         sparse_history.append(sparse_avg)
+        sparse_kl_history.append(sparse_kl_avg)
         grad_ent_history.append(grad_ent_avg)
         elapsed = time.time() - t0
 
         print(
             f"[{label}|STL] Epoch [{epoch+1:3d}/{epochs}]  "
             f"CE={ce_avg:.4f}  Topo={topo_avg:.5f}  Ent={ent_avg:.5f}  "
-            f"KL={kl_avg:.5f}  Sparse={sparse_avg:.5f}  GradH={grad_ent_avg:.4f}  Val={acc:.2f}%  t={elapsed:.1f}s"
+            f"KL={kl_avg:.5f}  Sparse={sparse_avg:.5f}  SparseKL={sparse_kl_avg:.5f}  GradH={grad_ent_avg:.4f}  Val={acc:.2f}%  t={elapsed:.1f}s"
         )
 
         is_best = acc > best_acc
@@ -612,6 +783,7 @@ def run_pretrain(
         "entropy":      ent_history,
         "kl":           kl_history,
         "sparse":       sparse_history,
+        "sparse_kl":    sparse_kl_history,
         "grad_entropy": grad_ent_history,
     }
     return base_model, best_acc, acc_history, loss_history
@@ -669,11 +841,12 @@ def run_finetune(
     ent_history:      list[float] = []
     kl_history:       list[float] = []
     sparse_history:   list[float] = []
+    sparse_kl_history: list[float] = []
     grad_ent_history: list[float] = []
 
     for epoch in range(epochs):
         t0 = time.time()
-        ce_avg, topo_avg, ent_avg, kl_avg, sparse_avg, grad_ent_avg = _train_one_epoch(
+        ce_avg, topo_avg, ent_avg, kl_avg, sparse_avg, sparse_kl_avg, grad_ent_avg = _train_one_epoch(
             label=label, epoch=epoch, total_epochs=epochs, phase="CIFAR-FT",
             train_model=train_model, base_model=base_model,
             loader=train_loader, criterion=criterion,
@@ -694,12 +867,13 @@ def run_finetune(
         ent_history.append(ent_avg)
         kl_history.append(kl_avg)
         sparse_history.append(sparse_avg)
+        sparse_kl_history.append(sparse_kl_avg)
         grad_ent_history.append(grad_ent_avg)
 
         print(
             f"[{label}|CIFAR-FT] Epoch [{epoch+1:3d}/{epochs}]  "
             f"CE={ce_avg:.4f}  Topo={topo_avg:.5f}  Ent={ent_avg:.5f}  "
-            f"KL={kl_avg:.5f}  Sparse={sparse_avg:.5f}  GradH={grad_ent_avg:.4f}  "
+            f"KL={kl_avg:.5f}  Sparse={sparse_avg:.5f}  SparseKL={sparse_kl_avg:.5f}  GradH={grad_ent_avg:.4f}  "
             f"CIFAR={cifar_acc:.2f}%  STL={stl_acc:.2f}%  t={time.time()-t0:.1f}s"
         )
 
@@ -718,6 +892,7 @@ def run_finetune(
         "entropy":      ent_history,
         "kl":           kl_history,
         "sparse":       sparse_history,
+        "sparse_kl":    sparse_kl_history,
         "grad_entropy": grad_ent_history,
     }
     return cifar_history[-1], stl_history[-1], cifar_history, stl_history, ft_loss_history

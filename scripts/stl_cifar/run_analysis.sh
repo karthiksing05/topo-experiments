@@ -6,7 +6,6 @@
 #SBATCH --cpus-per-task=4
 #SBATCH -t 00:30:00
 #SBATCH -q inferno
-#SBATCH --gres=gpu:1
 #SBATCH -o /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_analysis_%j.out
 #SBATCH -e /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_analysis_%j.err
 

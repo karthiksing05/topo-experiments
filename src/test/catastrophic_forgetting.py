@@ -83,20 +83,22 @@ import numpy as np
 # ── project root ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-VARIANT_LABELS = ["baseline", "topo_only", "topo_sparsity", "topo_l1sparse"]
-TOPO_VARIANTS  = ["topo_only", "topo_sparsity", "topo_l1sparse"]
+VARIANT_LABELS = ["baseline", "topo_only", "topo_sparsity", "topo_l1sparse", "topo_gradsurg"]
+TOPO_VARIANTS  = ["topo_only", "topo_sparsity", "topo_l1sparse", "topo_gradsurg"]
 
 COLORS = {
-    "baseline":      "#7f8c8d",
-    "topo_only":     "#2980b9",
-    "topo_sparsity": "#27ae60",
-    "topo_l1sparse": "#e67e22",
+    "baseline":       "#7f8c8d",
+    "topo_only":      "#2980b9",
+    "topo_sparsity":  "#27ae60",
+    "topo_l1sparse":  "#e67e22",
+    "topo_gradsurg":  "#8e44ad",
 }
 DISPLAY_NAMES = {
     "baseline":      "Baseline",
     "topo_only":     "Topo Only",
     "topo_sparsity": "Topo + Sparsity",
     "topo_l1sparse": "Topo + L1-Sparse",
+    "topo_gradsurg": "Topo + GradSurg",
 }
 
 STL10_CLASSES  = ["airplane", "bird",   "car",   "cat",   "deer",
@@ -106,7 +108,7 @@ CIFAR10_CLASSES = ["airplane", "automobile", "bird",  "cat",   "deer",
 
 # Default residual conv layer used for selectivity maps (ResNet-18 final block)
 SEL_LAYER = "layer4.1.conv2"
-MARKERS = {"baseline": "o", "topo_only": "s", "topo_sparsity": "^", "topo_l1sparse": "D"}
+MARKERS = {"baseline": "o", "topo_only": "s", "topo_sparsity": "^", "topo_l1sparse": "D", "topo_gradsurg": "P"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -485,7 +487,8 @@ def plot_topo_loss_curves(data, out_dir):
         pretrain_key="pretrain_topo_per_epoch",
         ft_keys=["ft_topo_per_epoch", "finetune_topo_per_epoch"],
         ylabel="TopoLoss",
-        title="Topographic Loss (LaplacianPyramid) — Topo Variants Only",
+        title="Topographic Loss (LaplacianPyramid) — Topo Variants Only\n"
+               "(GradSurg: real TopoLoss pretrain; flat zero during finetune — gradient surgery replaces topo penalty)",
         out_path=out_dir / "8_topo_loss_curves.png",
     )
 
@@ -542,22 +545,614 @@ def plot_grad_entropy_curves(data, out_dir):
 
 
 def plot_kl_curves(data, out_dir):
-    """Plot 10b — KL divergence from uniform distribution across pretrain and finetune.
+    """Plot 10b — KL-type penalties: softmax KL (topo_sparsity) + batch-diversity
+    L1 SparseKL (topo_l1sparse) overlaid on the same axes.
 
-    Measures how far the batch-mean cortical activation distribution (softmax)
-    deviates from uniform.  Large KL = some cortical regions dominate;
-    small KL = activations spread evenly across the sheet.
-    Active for topo_sparsity (lambda_kl > 0); zero for other variants.
+    - Softmax KL: how far batch-mean softmax activation deviates from uniform.
+    - SparseKL: how far batch-mean L1-normalised activation deviates from uniform;
+      encourages the cortical sheet to fire across all units at the batch level
+      even while individual instances are sparse.
     """
-    _two_phase_loss_plot(
-        data,
-        pretrain_key="pretrain_kl_per_epoch",
-        ft_keys=["ft_kl_per_epoch"],
-        ylabel="KL Divergence from Uniform (batch-mean softmax)",
-        title="Cortical KL Penalty — All Variants",
-        out_path=out_dir / "10b_kl_curves.png",
-        variants=VARIANT_LABELS,
+    # Series definitions: (variant, pretrain_key, ft_key, label_suffix, linestyle)
+    series = [
+        ("topo_sparsity",  "pretrain_kl_per_epoch",        "ft_kl_per_epoch",
+         "Softmax KL",  "-"),
+        ("topo_l1sparse",  "pretrain_sparse_kl_per_epoch",  "ft_sparse_kl_per_epoch",
+         "SparseKL",    "--"),
+    ]
+
+    fig, (ax_pre, ax_ft) = plt.subplots(1, 2, figsize=(14, 5))
+    any_pre = any_ft = False
+
+    for variant, pre_key, ft_key, suffix, ls in series:
+        if variant not in data:
+            continue
+        color  = COLORS[variant]
+        marker = MARKERS[variant]
+        name   = f"{DISPLAY_NAMES[variant]} ({suffix})"
+
+        pre_curve = _get(data[variant], pre_key)
+        if pre_curve:
+            ax_pre.plot(_epochs(pre_curve), pre_curve,
+                        label=name, color=color, linewidth=2,
+                        linestyle=ls, marker=marker, markersize=3,
+                        markevery=max(1, len(pre_curve) // 20))
+            any_pre = True
+
+        ft_curve = _get(data[variant], ft_key)
+        if ft_curve:
+            ax_ft.plot(_epochs(ft_curve), ft_curve,
+                       label=name, color=color, linewidth=2,
+                       linestyle=ls, marker=marker, markersize=3,
+                       markevery=max(1, len(ft_curve) // 15))
+            any_ft = True
+
+    if not any_pre and not any_ft:
+        print("  [SKIP] plot_kl_curves — no data")
+        plt.close(fig)
+        return
+
+    for ax, phase, has_data in [
+        (ax_pre, "Pretraining", any_pre),
+        (ax_ft,  "Finetuning",  any_ft),
+    ]:
+        ax.set_xlabel(f"{phase} Epoch", fontsize=11)
+        ax.set_ylabel("KL Divergence from Uniform", fontsize=11)
+        ax.set_title(f"{phase} Phase", fontsize=11)
+        _apply_loss_fmt(ax)
+        if has_data:
+            _add_legend(ax)
+        else:
+            ax.text(0.5, 0.5, "No data available", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=12, color="gray")
+
+    fig.suptitle(
+        "Cortical KL Penalties — Softmax KL (topo_sparsity) + SparseKL (topo_l1sparse)",
+        fontsize=13,
     )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, out_dir / "10b_kl_curves.png")
+
+
+def plot_gradsurg_mask_density(data, out_dir):
+    """Plot 10c — gradient-surgery mask density (fraction of cortical units
+    NOT zeroed out) during CIFAR-10 finetuning for the topo_gradsurg variant.
+
+    A value of 0.25 means the top-25%% most reactive cortical units per step
+    were allowed to update; the remaining 75%% were masked to zero gradient.
+    Tracking this confirms the surgery is active and unchanged across epochs.
+    """
+    label = "topo_gradsurg"
+    if label not in data:
+        print("  [SKIP] gradsurg_mask_density — topo_gradsurg not in data")
+        return
+    ft_curve = _get(data[label], "ft_mask_density_per_epoch")
+    if not ft_curve:
+        print("  [SKIP] gradsurg_mask_density — ft_mask_density_per_epoch absent")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(_epochs(ft_curve), ft_curve,
+            color=COLORS[label], linewidth=2,
+            marker=MARKERS[label], markersize=4,
+            markevery=max(1, len(ft_curve) // 15),
+            label=DISPLAY_NAMES[label])
+    ax.set_xlabel("Finetuning Epoch", fontsize=11)
+    ax.set_ylabel("Mask Density (fraction active)", fontsize=11)
+    ax.set_ylim(0.0, 1.0)
+    ax.axhline(ft_curve[0] if ft_curve else 0.25, color="gray",
+               linewidth=1, linestyle="--", alpha=0.6, label="Expected density")
+    ax.set_title(
+        "Gradient Surgery — Cortical Mask Density During Finetuning\n"
+        "(fraction of units allowed to update per step)",
+        fontsize=12,
+    )
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    _save(fig, out_dir / "10c_gradsurg_mask_density.png")
+
+
+def plot_gradsurg_cortical_entropy(data, out_dir):
+    """Plot 10d — Cortical-layer-only gradient entropy for topo_gradsurg.
+
+    Unlike the full-model gradient entropy (Plot 10), which averages over all
+    ResNet-18 parameters and is pulled toward 1.0 by the many unmasked backbone
+    layers, this plot measures entropy *only* on the cortical conv weights where
+    the surgical hooks operate.  Expected behaviour:
+
+      - Pretrain: moderate (~0.93–0.95) — same as other topo variants
+      - Finetune: drops sharply toward 0 as the top-25%% mask concentrates
+        gradient mass into a small spatial patch each step
+
+    The gap between pretrain and finetune cortical entropy is the cleanest
+    diagnostic that gradient surgery is functioning as intended.
+    """
+    label = "topo_gradsurg"
+    if label not in data:
+        print("  [SKIP] gradsurg_cortical_entropy — topo_gradsurg not in data")
+        return
+
+    pretrain_curve = _get(data[label], "pretrain_grad_entropy_per_epoch")
+    ft_curve       = _get(data[label], "ft_cortical_grad_entropy_per_epoch")
+
+    if not pretrain_curve and not ft_curve:
+        print("  [SKIP] gradsurg_cortical_entropy — no gradient entropy data")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+    # Left panel: pretrain full-model entropy (for reference baseline)
+    ax = axes[0]
+    if pretrain_curve:
+        ax.plot(_epochs(pretrain_curve), pretrain_curve,
+                color=COLORS[label], linewidth=2,
+                marker=MARKERS[label], markersize=3,
+                markevery=max(1, len(pretrain_curve) // 15),
+                label=DISPLAY_NAMES[label])
+    ax.set_xlabel("Pretrain Epoch", fontsize=11)
+    ax.set_ylabel("Gradient Entropy H\u2090 (0–1)", fontsize=11)
+    ax.set_title("Pretrain Phase — Full-Model Gradient Entropy\n"
+                 "(reference: hooks not yet applied)", fontsize=11)
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    # Right panel: finetune cortical-only entropy — the key diagnostic
+    ax = axes[1]
+    if ft_curve:
+        ax.plot(_epochs(ft_curve), ft_curve,
+                color=COLORS[label], linewidth=2.5,
+                marker=MARKERS[label], markersize=4,
+                markevery=max(1, len(ft_curve) // 15),
+                label="Cortical layers only")
+        # Also show full-model finetune entropy for comparison
+        ft_full = _get(data[label], "ft_grad_entropy_per_epoch")
+        if ft_full:
+            ax.plot(_epochs(ft_full), ft_full,
+                    color=COLORS[label], linewidth=1.5, linestyle="--",
+                    alpha=0.55,
+                    marker=MARKERS[label], markersize=3,
+                    markevery=max(1, len(ft_full) // 15),
+                    label="All layers (diluted)")
+    else:
+        ax.text(0.5, 0.5,
+                "No ft_cortical_grad_entropy data\n(re-run training to generate)",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("Finetune Epoch", fontsize=11)
+    ax.set_ylabel("Gradient Entropy H\u2090 (0–1)", fontsize=11)
+    ax.set_title("Finetune Phase — Cortical-Only vs. Full-Model Entropy\n"
+                 "(cortical entropy shows true sparsification effect)", fontsize=11)
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    fig.suptitle(
+        "Gradient Surgery — Cortical-Layer Gradient Entropy\n"
+        "(cortical-only metric isolates the surgical masking effect from backbone dilution)",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    _save(fig, out_dir / "10d_gradsurg_cortical_entropy.png")
+
+
+def plot_gradsurg_finetune_comparison(data, out_dir):
+    """Plot 11 — Gradient-surgery dedicated finetune comparison.
+
+    Four-panel figure isolating what makes the finetune phase for topo_gradsurg
+    distinctive vs. the loss-penalty based topo variants:
+
+      Top-left:  Finetune CE loss (all variants) — gradsurg: CE only, no
+                 auxiliary penalties; baseline has no regularisation either, so
+                 the comparison shows whether gated gradients hurt CE optimisation.
+      Top-right: Gradient entropy during finetuning only (all topo variants).
+                 Key story: masked gradients → lower entropy for gradsurg.
+      Bottom-left: STL-10 accuracy trajectory during CIFAR-10 finetuning.
+                 Shows how quickly STL-10 performance degrades for each variant.
+      Bottom-right: Pretrain TopoLoss (topo variants only) — confirms gradsurg
+                 has the same pretrain objective as the other topo methods, making
+                 the finetune difference a fair comparison of regularisation strategy.
+    """
+    present = [l for l in VARIANT_LABELS if l in data]
+    topo_present = [l for l in TOPO_VARIANTS if l in data]
+    if not present:
+        print("  [SKIP] gradsurg_finetune_comparison — no variant data")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # ---- Top-left: finetune CE loss (all variants) ----------------------------
+    ax = axes[0, 0]
+    gs_lw = {"topo_gradsurg": 3.0}  # thicker line for gradsurg
+    for label in present:
+        curve = _get(data[label], "ft_ce_per_epoch", "finetune_ce_per_epoch")
+        if not curve:
+            continue
+        lw = gs_lw.get(label, 1.8)
+        ax.plot(_epochs(curve), curve,
+                label=DISPLAY_NAMES[label], color=COLORS[label],
+                linewidth=lw, marker=MARKERS[label], markersize=3,
+                markevery=max(1, len(curve) // 15),
+                zorder=3 if label == "topo_gradsurg" else 2)
+    ax.set_xlabel("Finetune Epoch", fontsize=11)
+    ax.set_ylabel("CE Loss", fontsize=11)
+    ax.set_title("Finetune CE Loss — All Variants\n"
+                 "(GradSurg: CE only, zero auxiliary penalties)",
+                 fontsize=11)
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    # ---- Top-right: gradient entropy finetune only (topo variants) ------------
+    ax = axes[0, 1]
+    for label in topo_present:
+        curve = _get(data[label], "ft_grad_entropy_per_epoch")
+        if not curve:
+            continue
+        lw = 3.0 if label == "topo_gradsurg" else 1.8
+        ax.plot(_epochs(curve), curve,
+                label=DISPLAY_NAMES[label], color=COLORS[label],
+                linewidth=lw, marker=MARKERS[label], markersize=3,
+                markevery=max(1, len(curve) // 15),
+                zorder=3 if label == "topo_gradsurg" else 2)
+    if not any(_get(data[l], "ft_grad_entropy_per_epoch") for l in topo_present):
+        ax.text(0.5, 0.5, "No gradient entropy data",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("Finetune Epoch", fontsize=11)
+    ax.set_ylabel("Gradient Entropy H\u2090 (0–1)", fontsize=11)
+    ax.set_title("Gradient Entropy During Finetuning — Topo Variants\n"
+                 "(GradSurg: masked gradients \u2192 lower entropy expected)",
+                 fontsize=11)
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    # ---- Bottom-left: STL-10 accuracy during finetuning (all variants) --------
+    ax = axes[1, 0]
+    for label in present:
+        curve = _get(data[label], "ft_stl_acc_per_epoch", "finetune_stl_acc_per_epoch")
+        if not curve:
+            continue
+        lw = 3.0 if label == "topo_gradsurg" else 1.8
+        ax.plot(_epochs(curve), curve,
+                label=DISPLAY_NAMES[label], color=COLORS[label],
+                linewidth=lw, marker=MARKERS[label], markersize=3,
+                markevery=max(1, len(curve) // 15),
+                zorder=3 if label == "topo_gradsurg" else 2)
+    if not any(_get(data[l], "ft_stl_acc_per_epoch", "finetune_stl_acc_per_epoch")
+               for l in present):
+        ax.text(0.5, 0.5, "No STL-10 finetune accuracy data",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("Finetune Epoch", fontsize=11)
+    ax.set_ylabel("STL-10 Val Accuracy (%)", fontsize=11)
+    ax.set_title("STL-10 Accuracy During CIFAR-10 Finetuning\n"
+                 "(forgetting dynamics — GradSurg highlighted)",
+                 fontsize=11)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    # ---- Bottom-right: pretrain Topo loss — topo variants only ----------------
+    ax = axes[1, 1]
+    for label in topo_present:
+        curve = _get(data[label], "pretrain_topo_per_epoch")
+        if not curve:
+            continue
+        lw = 3.0 if label == "topo_gradsurg" else 1.8
+        ax.plot(_epochs(curve), curve,
+                label=DISPLAY_NAMES[label], color=COLORS[label],
+                linewidth=lw, marker=MARKERS[label], markersize=3,
+                markevery=max(1, len(curve) // 15),
+                zorder=3 if label == "topo_gradsurg" else 2)
+    if not any(_get(data[l], "pretrain_topo_per_epoch") for l in topo_present):
+        ax.text(0.5, 0.5, "No pretrain TopoLoss data",
+                ha="center", va="center", transform=ax.transAxes, fontsize=11)
+    ax.set_xlabel("Pretrain Epoch", fontsize=11)
+    ax.set_ylabel("TopoLoss", fontsize=11)
+    ax.set_title("Pretrain Topo Loss — Topo Variants\n"
+                 "(all topo methods share same pretrain objective)",
+                 fontsize=11)
+    _add_legend(ax)
+    ax.grid(linestyle="--", alpha=0.4)
+
+    fig.suptitle(
+        "Gradient Surgery vs. Loss-Penalty Topo Variants — Finetune Phase Breakdown\n"
+        "(GradSurg replaces auxiliary loss penalties with gradient masking during CIFAR-10 finetuning)",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    _save(fig, out_dir / "11_gradsurg_finetune_comparison.png")
+
+
+def plot_stl_per_class_acc(data, out_dir):
+    """Plot 18 — Per-class STL-10 accuracy before and after CIFAR-10 finetuning.
+
+    Each STL-10 class gets a group of bars (one per variant).  The STL-10-
+    exclusive class (monkey, index 7) is cross-hatched because it has no
+    CIFAR-10 counterpart and therefore receives *no* finetuning signal,
+    making it the purest probe of catastrophic forgetting.
+    """
+    STL_EXCLUSIVE_IDX = {7}   # monkey — not in CIFAR-10
+    present = [l for l in VARIANT_LABELS if l in data]
+    if not present:
+        print("  [SKIP] stl_per_class_acc — no data")
+        return
+    has_pc = any("stl_per_class_acc_after" in data[l] for l in present)
+    if not has_pc:
+        print("  [SKIP] stl_per_class_acc — per-class data absent "
+              "(re-run training to generate)")
+        return
+
+    n_cls = 10
+    n_var = len(present)
+    x     = np.arange(n_cls)
+    bar_w = 0.72 / n_var
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    for ax_idx, (phase_key, phase_title) in enumerate([
+        ("stl_per_class_acc_before", "Post-Pretrain  (Before Finetuning)"),
+        ("stl_per_class_acc_after",  "Post-Finetune  (After CIFAR-10 Training)"),
+    ]):
+        ax = axes[ax_idx]
+        for vi, label in enumerate(present):
+            rec  = data[label].get(phase_key, {})
+            vals = [
+                float(rec.get(str(c), rec.get(c, float("nan"))))
+                for c in range(n_cls)
+            ]
+            offsets = x + (vi - (n_var - 1) / 2.0) * bar_w
+            for xi in range(n_cls):
+                ax.bar(
+                    offsets[xi], vals[xi], bar_w * 0.92,
+                    color=COLORS[label], edgecolor="black", linewidth=0.5,
+                    hatch=("///" if xi in STL_EXCLUSIVE_IDX else ""),
+                    label=DISPLAY_NAMES[label] if xi == 0 else "_nolegend_",
+                    zorder=3,
+                )
+                # Annotate monkey bars in the after-finetuning panel with values
+                if ax_idx == 1 and xi in STL_EXCLUSIVE_IDX:
+                    v = vals[xi]
+                    if not (v != v):  # not NaN
+                        bar_x = offsets[xi]
+                        ax.text(bar_x, v + 0.8, f"{v:.1f}%",
+                                ha="center", va="bottom", fontsize=7,
+                                color=COLORS[label], fontweight="bold",
+                                rotation=90, zorder=5)
+        for exc in STL_EXCLUSIVE_IDX:
+            ax.axvspan(exc - 0.5, exc + 0.5, color="#ede7f6", alpha=0.5, zorder=0)
+            ax.text(exc, 104, "STL-only\n(monkey)", ha="center", va="bottom",
+                    fontsize=7.5, color="#6a0dad", fontstyle="italic")
+        ax.set_xticks(x)
+        ax.set_xticklabels(STL10_CLASSES, rotation=30, ha="right", fontsize=9)
+        ax.set_ylabel("STL-10 Val Accuracy (%)", fontsize=11)
+        ax.set_title(phase_title, fontsize=11)
+        ax.set_ylim(0, 116)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+        ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+        if ax_idx == 0:
+            ax.legend(fontsize=9, loc="lower right")
+
+    fig.suptitle(
+        "STL-10 Per-Class Accuracy: Before vs. After CIFAR-10 Finetuning\n"
+        "(hatched bars = STL-10 exclusive class absent from CIFAR-10 training)",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    _save(fig, out_dir / "18_stl_per_class_acc.png")
+
+
+def plot_stl_per_class_forgetting(data, out_dir):
+    """Plot 19 — Per-class STL-10 forgetting (acc_before − acc_after) per variant.
+
+    Each STL-10 class gets a group of bars showing how much accuracy was lost
+    after CIFAR-10 finetuning.  The STL-exclusive class (monkey, index 7) is
+    cross-hatched and its column is highlighted: because the model never sees
+    monkey during finetuning, any forgetting there is pure interference from
+    the CIFAR task rather than direct overwriting of a shared representation.
+    """
+    STL_EXCLUSIVE_IDX = {7}   # monkey — absent from CIFAR-10
+    present = [l for l in VARIANT_LABELS if l in data]
+    if not present:
+        print("  [SKIP] stl_per_class_forgetting — no data")
+        return
+    has_pc = any(
+        "stl_per_class_acc_before" in data[l] and "stl_per_class_acc_after" in data[l]
+        for l in present
+    )
+    if not has_pc:
+        print("  [SKIP] stl_per_class_forgetting — per-class data absent "
+              "(re-run training to generate)")
+        return
+
+    n_cls = 10
+    n_var = len(present)
+    x     = np.arange(n_cls)
+    bar_w = 0.72 / n_var
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    for vi, label in enumerate(present):
+        rec_before = data[label].get("stl_per_class_acc_before", {})
+        rec_after  = data[label].get("stl_per_class_acc_after",  {})
+        forgetting = []
+        for c in range(n_cls):
+            b = float(rec_before.get(str(c), rec_before.get(c, float("nan"))))
+            a = float(rec_after.get( str(c), rec_after.get( c, float("nan"))))
+            forgetting.append(b - a)   # positive = forgotten, negative = improved
+        offsets = x + (vi - (n_var - 1) / 2.0) * bar_w
+        for xi in range(n_cls):
+            ax.bar(
+                offsets[xi], forgetting[xi], bar_w * 0.92,
+                color=COLORS[label], edgecolor="black", linewidth=0.5,
+                hatch=("///" if xi in STL_EXCLUSIVE_IDX else ""),
+                label=DISPLAY_NAMES[label] if xi == 0 else "_nolegend_",
+                zorder=3,
+            )
+
+    # Highlight the STL-exclusive column — annotate after bars are drawn
+    for exc in STL_EXCLUSIVE_IDX:
+        ax.axvspan(exc - 0.5, exc + 0.5, color="#ede7f6", alpha=0.45, zorder=0)
+
+    ax.axhline(0, color="black", linewidth=0.8, zorder=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(STL10_CLASSES, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Acc drop after CIFAR finetuning (%)", fontsize=11)
+    ax.set_title(
+        "STL-10 Per-Class Forgetting After CIFAR-10 Finetuning\n"
+        "(positive = forgotten; hatched bar = STL-exclusive class)",
+        fontsize=12,
+    )
+    ax.legend(fontsize=9, loc="upper right")
+    # Add annotation after ylim is determined by data
+    ymax = ax.get_ylim()[1]
+    for exc in STL_EXCLUSIVE_IDX:
+        ax.text(exc, ymax * 0.97, "STL-only\n(monkey)", ha="center", va="top",
+                fontsize=8, color="#6a0dad", fontstyle="italic")
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    fig.tight_layout()
+    _save(fig, out_dir / "19_stl_per_class_forgetting.png")
+
+
+def plot_finetuned_vs_unfinetuned_forgetting(data, out_dir):
+    """Plot 20 — Forgetting split by finetuned / non-finetuned / monkey categories.
+
+    Left panel: per-class forgetting bars identical to plot 19, but with
+    background shading marking which STL-10 classes were included in the
+    CIFAR-10 finetune subset (green), which were excluded (orange), and the
+    STL-exclusive monkey class (purple).
+
+    Right panel: mean forgetting per group per variant as a grouped bar chart,
+    quantifying whether non-finetuned classes are better retained.
+    """
+    STL_EXCLUSIVE_IDX = {7}   # monkey — absent from CIFAR-10
+
+    present = [l for l in VARIANT_LABELS if l in data]
+    if not present:
+        print("  [SKIP] finetuned_vs_unfinetuned_forgetting — no data")
+        return
+    has_pc = any(
+        "stl_per_class_acc_before" in data[l] and "stl_per_class_acc_after" in data[l]
+        for l in present
+    )
+    if not has_pc:
+        print("  [SKIP] finetuned_vs_unfinetuned_forgetting — per-class data absent")
+        return
+
+    # Determine which STL classes were finetuned — read from first available result.
+    # Fall back to all 9 CIFAR-overlapping STL classes if key absent (old runs).
+    _ALL_OVERLAP_STL = {0, 1, 2, 3, 4, 5, 6, 8, 9}  # classes 0–9 minus monkey (7)
+    finetuned_set = None
+    for lbl in present:
+        ft_classes = data[lbl].get("finetuned_stl_classes")
+        if ft_classes is not None:
+            finetuned_set = set(ft_classes)
+            break
+    if finetuned_set is None:
+        finetuned_set = _ALL_OVERLAP_STL   # legacy: all overlap classes
+
+    not_finetuned_set = _ALL_OVERLAP_STL - finetuned_set
+
+    n_cls = 10
+    n_var = len(present)
+    x     = np.arange(n_cls)
+    bar_w = 0.72 / n_var
+
+    fig, (ax_pc, ax_grp) = plt.subplots(1, 2, figsize=(18, 6),
+                                         gridspec_kw={"width_ratios": [2, 1]})
+
+    # ── Left panel: per-class forgetting with background shading ──────────────
+    for vi, label in enumerate(present):
+        rec_before = data[label].get("stl_per_class_acc_before", {})
+        rec_after  = data[label].get("stl_per_class_acc_after",  {})
+        forgetting = []
+        for c in range(n_cls):
+            b = float(rec_before.get(str(c), rec_before.get(c, float("nan"))))
+            a = float(rec_after.get( str(c), rec_after.get( c, float("nan"))))
+            forgetting.append(b - a)
+        offsets = x + (vi - (n_var - 1) / 2.0) * bar_w
+        for xi in range(n_cls):
+            ax_pc.bar(
+                offsets[xi], forgetting[xi], bar_w * 0.92,
+                color=COLORS[label], edgecolor="black", linewidth=0.5,
+                hatch=("///" if xi in STL_EXCLUSIVE_IDX else ""),
+                label=DISPLAY_NAMES[label] if xi == 0 else "_nolegend_",
+                zorder=3,
+            )
+
+    # Background shading by group
+    for c in range(n_cls):
+        if c in STL_EXCLUSIVE_IDX:
+            ax_pc.axvspan(c - 0.5, c + 0.5, color="#ede7f6", alpha=0.5, zorder=0)
+        elif c in finetuned_set:
+            ax_pc.axvspan(c - 0.5, c + 0.5, color="#e8f5e9", alpha=0.5, zorder=0)
+        else:
+            ax_pc.axvspan(c - 0.5, c + 0.5, color="#fff3e0", alpha=0.5, zorder=0)
+
+    ax_pc.axhline(0, color="black", linewidth=0.8, zorder=2)
+    ax_pc.set_xticks(x)
+    ax_pc.set_xticklabels(STL10_CLASSES, rotation=30, ha="right", fontsize=9)
+    ax_pc.set_ylabel("Acc drop after CIFAR finetuning (%)", fontsize=11)
+    ax_pc.set_title(
+        "Per-Class STL-10 Forgetting\n"
+        "(green = finetuned class; orange = excluded; purple = STL-only)",
+        fontsize=11,
+    )
+    ax_pc.legend(fontsize=8, loc="upper right")
+    ax_pc.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+
+    # Annotations: group labels above the axis
+    ymax_pc = ax_pc.get_ylim()[1]
+    for c in range(n_cls):
+        if c in STL_EXCLUSIVE_IDX:
+            ax_pc.text(c, ymax_pc * 0.97, "STL\nonly", ha="center", va="top",
+                       fontsize=7, color="#6a0dad", fontstyle="italic")
+        elif c in finetuned_set:
+            ax_pc.text(c, ymax_pc * 0.97, "FT", ha="center", va="top",
+                       fontsize=7, color="#2e7d32", fontweight="bold")
+        else:
+            ax_pc.text(c, ymax_pc * 0.97, "excl.", ha="center", va="top",
+                       fontsize=7, color="#e65100", fontstyle="italic")
+
+    # ── Right panel: mean forgetting per group per variant ────────────────────
+    groups = [
+        ("Finetuned",     finetuned_set,      "#4caf50"),
+        ("Not Finetuned", not_finetuned_set,  "#ff9800"),
+        ("Monkey\n(STL-only)", STL_EXCLUSIVE_IDX, "#9c27b0"),
+    ]
+    n_grp = len(groups)
+    gx    = np.arange(n_grp)
+    grp_bar_w = 0.7 / n_var
+
+    for vi, label in enumerate(present):
+        rec_before = data[label].get("stl_per_class_acc_before", {})
+        rec_after  = data[label].get("stl_per_class_acc_after",  {})
+        means = []
+        for _, idx_set, _ in groups:
+            vals = []
+            for c in idx_set:
+                b = float(rec_before.get(str(c), rec_before.get(c, float("nan"))))
+                a = float(rec_after.get( str(c), rec_after.get( c, float("nan"))))
+                if not (np.isnan(b) or np.isnan(a)):
+                    vals.append(b - a)
+            means.append(float(np.mean(vals)) if vals else float("nan"))
+
+        offsets = gx + (vi - (n_var - 1) / 2.0) * grp_bar_w
+        ax_grp.bar(
+            offsets, means, grp_bar_w * 0.88,
+            color=COLORS[label], edgecolor="black", linewidth=0.5,
+            label=DISPLAY_NAMES[label], zorder=3,
+        )
+
+    ax_grp.axhline(0, color="black", linewidth=0.8, zorder=2)
+    ax_grp.set_xticks(gx)
+    ax_grp.set_xticklabels([g[0] for g in groups], fontsize=10)
+    ax_grp.set_ylabel("Mean acc drop (%)", fontsize=11)
+    ax_grp.set_title("Mean Forgetting by Group", fontsize=11)
+    ax_grp.legend(fontsize=8, loc="upper right")
+    ax_grp.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+
+    fig.suptitle(
+        "STL-10 Forgetting: Finetuned vs Non-Finetuned Categories",
+        fontsize=13,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    _save(fig, out_dir / "20_finetuned_vs_unfinetuned_forgetting.png")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -956,15 +1551,31 @@ def _plot_selectivity_grid(
 ) -> None:
     """
     Plot a grid of selectivity heat-maps.
-    Rows = stimulus categories, Columns = model variants.
+    Rows = stimulus categories.
+    Columns = [category label] + model variants, each with its own colorbar.
     variant_maps: {label: np.ndarray(n_classes, H, W)}
     """
     n_classes  = len(class_names)
     n_variants = len(labels_ordered)
+    n_cols     = 1 + n_variants   # label column + one per variant
+
+    # Per-variant colour scale (independent dynamic range per column)
+    col_vabs = {}
+    for label in labels_ordered:
+        maps = variant_maps.get(label)
+        if maps is not None:
+            col_vabs[label] = float(np.nanmax(np.abs(maps.reshape(-1)))) or 1.0
+        else:
+            col_vabs[label] = 1.0
+
+    # Width ratios: label column narrow, then map column + small cbar gap per variant
+    # We add extra horizontal space (wider per-variant allotment) for the colorbars
+    width_ratios = [0.45] + [1.0] * n_variants
 
     fig, axes = plt.subplots(
-        n_classes, n_variants,
-        figsize=(3.2 * n_variants, 2.2 * n_classes),
+        n_classes, n_cols,
+        figsize=(0.45 * 3.2 + 4.2 * n_variants, 2.2 * n_classes),
+        gridspec_kw={"width_ratios": width_ratios},
         squeeze=False,
     )
     fig.patch.set_facecolor("#1a1a2e")
@@ -973,33 +1584,58 @@ def _plot_selectivity_grid(
     cmap = plt.cm.RdGy_r.copy()
     cmap.set_bad("black")
 
-    # Shared colour scale across all panels
-    all_vals = np.concatenate([
-        v.reshape(-1) for v in variant_maps.values()
-    ])
-    vabs = float(np.nanmax(np.abs(all_vals))) or 1.0
+    # ---- Column 0: category labels ----------------------------------------
+    for row, cls in enumerate(class_names):
+        ax = axes[row][0]
+        ax.set_facecolor("#1a1a2e")
+        ax.text(
+            0.5, 0.5, cls,
+            ha="center", va="center",
+            color="white", fontsize=10, fontweight="bold",
+            transform=ax.transAxes,
+            wrap=False,
+        )
+        ax.axis("off")
+        if row == 0:
+            ax.set_title("Category", color="#aaaaaa", fontsize=9, fontweight="bold")
 
-    for col, label in enumerate(labels_ordered):
-        maps = variant_maps.get(label)   # (n_classes, H, W)
-        for row, cls in enumerate(class_names):
+    # ---- Columns 1‥N: selectivity maps (per-variant colour scale) ----------
+    col_images = {}   # store last imshow per column for colorbar
+    for col_offset, label in enumerate(labels_ordered):
+        col   = col_offset + 1
+        maps  = variant_maps.get(label)   # (n_classes, H, W)
+        vabs_c = col_vabs[label]
+        for row in range(n_classes):
             ax = axes[row][col]
             if maps is None:
-                ax.set_visible(False)
+                ax.set_facecolor("#1a1a2e")
+                ax.axis("off")
                 continue
-            im = ax.imshow(maps[row], cmap=cmap, vmin=-vabs, vmax=vabs,
+            im = ax.imshow(maps[row], cmap=cmap, vmin=-vabs_c, vmax=vabs_c,
                            aspect="auto", interpolation="nearest")
             ax.axis("off")
             if row == 0:
                 ax.set_title(DISPLAY_NAMES.get(label, label),
                              color="white", fontsize=9, fontweight="bold")
-            if col == 0:
-                ax.set_ylabel(cls, color="white", fontsize=8)
-                ax.yaxis.set_label_position("left")
+            col_images[col] = im
 
-    # Shared colour bar
-    cbar = fig.colorbar(im, ax=axes, fraction=0.012, pad=0.02)
-    cbar.ax.tick_params(colors="white", labelsize=7)
-    cbar.set_label("selectivity", color="white", fontsize=8)
+    # ---- Per-column colorbars (one per variant, spanning all rows) ----------
+    for col_offset, label in enumerate(labels_ordered):
+        col = col_offset + 1
+        if col not in col_images:
+            continue
+        im_c   = col_images[col]
+        vabs_c = col_vabs[label]
+        sm = plt.cm.ScalarMappable(
+            cmap=cmap,
+            norm=plt.Normalize(vmin=-vabs_c, vmax=vabs_c),
+        )
+        sm.set_array([])
+        col_axes = list(axes[:, col])
+        cbar = fig.colorbar(sm, ax=col_axes, location="right",
+                            shrink=0.7, pad=0.04, aspect=25)
+        cbar.ax.tick_params(colors="white", labelsize=6)
+        cbar.set_label("selectivity", color="white", fontsize=7, labelpad=2)
 
     plt.tight_layout()
     out_path = out_dir / filename
@@ -1126,7 +1762,7 @@ def plot_selectivity_diagrams(
         col_w = 14
         header = f"Class".ljust(col_w)
         for lbl in labels_ord:
-            header += VARIANT_LABELS[lbl].rjust(col_w)
+            header += DISPLAY_NAMES[lbl].rjust(col_w)
         print(f"\n─── Category Selectivity [mean |selectivity|] ─── {ckpt_phase} / {dataset_tag}")
         print(header)
         print("─" * (col_w + col_w * len(labels_ord)))
@@ -1230,6 +1866,9 @@ def main():
     plot_finetune_stl_acc(data, out_dir)
     plot_forgetting_bar(data, out_dir)
     plot_accuracy_overview(data, out_dir)
+    plot_stl_per_class_acc(data, out_dir)
+    plot_stl_per_class_forgetting(data, out_dir)
+    plot_finetuned_vs_unfinetuned_forgetting(data, out_dir)
 
     print("Generating CE loss plots …")
     plot_pretrain_ce_loss(data, out_dir)
@@ -1239,12 +1878,15 @@ def main():
     plot_grad_entropy_curves(data, out_dir)
     print("Generating KL divergence plots …")
     plot_kl_curves(data, out_dir)
+    plot_gradsurg_mask_density(data, out_dir)
+    plot_gradsurg_cortical_entropy(data, out_dir)
 
     if not args.no_topo_plots:
         print("Generating topo/entropy loss plots …")
         plot_topo_loss_curves(data, out_dir)
         plot_entropy_loss_curves(data, out_dir)
         plot_l1sparse_loss_curves(data, out_dir)
+        plot_gradsurg_finetune_comparison(data, out_dir)
 
     if not args.no_cortical_plots:
         print("Generating cortical sheet weight plots …")

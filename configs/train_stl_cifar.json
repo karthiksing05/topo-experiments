@@ -9,15 +9,16 @@
   "device": "cuda",
   "num_workers": 8,
   "include_downsample": false,
-  "lambda_topo": 10.0,
+  "finetune_cifar_classes": [0, 2, 4, 5, 8],
+  "grad_surg_percentile": 50.0,
   "default_layer_cfg": {
-    "topo_scale": 10.0,
+    "topo_scale": 5.0,
     "factor_h": 4.0,
     "factor_w": 4.0,
-    "lambda_topo": 10.0,
-    "lambda_entropy": 1.0,
-    "lambda_kl": 0.2,
-    "lambda_sparse": 1.0
+    "lambda_entropy": 5.0,
+    "lambda_kl": 1.0,
+    "lambda_sparse": 5.0,
+    "lambda_sparse_kl": 1.5
   },
   "layers": {}
 }

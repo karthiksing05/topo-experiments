@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=stl_cifar_topo_sparsity
+#SBATCH --job-name=stl_cifar_topo_gradsurg
 #SBATCH --account=gts-aivanova7-lab
 #SBATCH -N1 --ntasks-per-node=1
 #SBATCH --mem=32GB
@@ -7,8 +7,8 @@
 #SBATCH -t 24:00:00
 #SBATCH -q inferno
 #SBATCH --gres=gpu:1
-#SBATCH -o /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_topo_sparsity_%j.out
-#SBATCH -e /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_topo_sparsity_%j.err
+#SBATCH -o /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_topo_gradsurg_%j.out
+#SBATCH -e /storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/stl_cifar_topo_gradsurg_%j.err
 
 set -euo pipefail
 
@@ -39,13 +39,13 @@ mkdir -p "${EXPERIMENT_DIR}/outputs/stl_cifar/checkpoints"
 cd "${EXPERIMENT_DIR}"
 
 echo "======================================================="
-echo "  Job: stl_cifar_topo_sparsity"
+echo "  Job: stl_cifar_topo_gradsurg"
 echo "  Date: $(date)"
 echo "  Node: $(hostname)"
 echo "  GPU:  $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "======================================================="
 
-python src/stl_cifar/train_stl_cifar_topo_sparsity.py \
+python src/stl_cifar/train_stl_cifar_topo_gradsurg.py \
     --config configs/train_stl_cifar.json
 
 echo "Job finished at $(date)"
