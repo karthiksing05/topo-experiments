@@ -30,9 +30,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Make train/ importable so we can reuse the shared model & vis functions.
-_TRAIN_DIR = Path(__file__).resolve().parents[1] / "train"
-sys.path.insert(0, str(_TRAIN_DIR))
+# Add this directory to sys.path so we can import from train_fmnist_topo.
+_THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_THIS_DIR))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -42,7 +42,7 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 
-from train_topo_sparsity import (           # shared definitions
+from train_fmnist_topo import (              # shared definitions
     BASE_DIR,
     SimpleNN,
     FMNIST_CLASSES,

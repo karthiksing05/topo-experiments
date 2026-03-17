@@ -48,13 +48,14 @@ cd "$EXPERIMENT_DIR"
 mkdir -p scripts/logs
 mkdir -p "${HF_CACHE_DIR}"
 mkdir -p outputs/train_topo_sparsity/checkpoints
+mkdir -p scripts/fashion_mnist_forgetting
 
 # -- Configurable via sbatch --export= -----------------------------------------
 # Per-layer settings (topo_scale, factor_h, factor_w, lambda_kl, lambda_entropy)
 # live in the JSON config file — edit configs/train_topo_sparsity.json directly.
 # Top-level knobs below can still be overridden here or via --export on sbatch.
 
-CONFIG_FILE="${CONFIG_FILE:-${EXPERIMENT_DIR}/configs/train_topo_sparsity.json}"
+CONFIG_FILE="${CONFIG_FILE:-${EXPERIMENT_DIR}/configs/fashion_mnist_forgetting_pretrain.json}"
 DATA_DIR="${DATA_DIR:-}"                  # null → project-root/data (set in JSON or here)
 OUTPUT_DIR="${OUTPUT_DIR:-}"              # null → project-root/outputs/train_topo_sparsity
 EPOCHS="${EPOCHS:-}"                      # null → use JSON value
@@ -86,7 +87,7 @@ OVERRIDE_ARGS=""
 [[ -n "$RESUME_TOPO_ONLY" ]] && OVERRIDE_ARGS+=" --resume-topo-only ${RESUME_TOPO_ONLY}"
 [[ -n "$RESUME_BASE"    ]] && OVERRIDE_ARGS+=" --resume-base ${RESUME_BASE}"
 
-srun python -u src/misc/train_topo_sparsity.py \
+srun python -u src/fashion_mnist_forgetting/train_fmnist_topo.py \
     --config "${CONFIG_FILE}" \
     ${OVERRIDE_ARGS}
 
