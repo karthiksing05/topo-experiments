@@ -46,9 +46,11 @@ mkdir -p outputs/fashion_mnist_forgetting/checkpoints
 mkdir -p outputs/fashion_mnist_forgetting/results
 
 # -- Configurable via sbatch --export= -----------------------------------------
-# noise_target_class: which FashionMNIST class to use as noise label
+# noise_target_class: which FashionMNIST class to use as the finetune target label
 #   0=T-shirt  1=Trouser  2=Pullover  3=Dress  4=Coat
 #   5=Sandal   6=Shirt    7=Sneaker   8=Bag    9=AnkleBoot
+# ft_source_class: source class whose real images are used as stimuli (relabeled
+#   as noise_target_class). Leave unset for pure-noise mode.
 
 CONFIG_FILE="${CONFIG_FILE:-${EXPERIMENT_DIR}/configs/fashion_mnist_forgetting.json}"
 DATA_DIR="${DATA_DIR:-}"
@@ -61,6 +63,7 @@ FINETUNE_LR="${FINETUNE_LR:-}"
 DEVICE="${DEVICE:-cuda:0}"
 NOISE_TARGET="${NOISE_TARGET:-}"
 NOISE_SAMPLES="${NOISE_SAMPLES:-}"
+FT_SOURCE_CLASS="${FT_SOURCE_CLASS:-}"
 
 echo ""
 echo "config          : ${CONFIG_FILE}"
@@ -68,6 +71,7 @@ echo "device          : ${DEVICE}"
 [[ -n "$PRETRAIN_EPOCHS" ]] && echo "pretrain_epochs : ${PRETRAIN_EPOCHS} (override)"
 [[ -n "$FINETUNE_EPOCHS" ]] && echo "finetune_epochs : ${FINETUNE_EPOCHS} (override)"
 [[ -n "$NOISE_TARGET"    ]] && echo "noise_target    : ${NOISE_TARGET}    (override)"
+[[ -n "$FT_SOURCE_CLASS" ]] && echo "ft_source_class : ${FT_SOURCE_CLASS}  (override)"
 echo ""
 
 OVERRIDE_ARGS=""
@@ -81,6 +85,7 @@ OVERRIDE_ARGS=""
 [[ -n "$DEVICE"           ]] && OVERRIDE_ARGS+=" --device ${DEVICE}"
 [[ -n "$NOISE_TARGET"     ]] && OVERRIDE_ARGS+=" --noise-target-class ${NOISE_TARGET}"
 [[ -n "$NOISE_SAMPLES"    ]] && OVERRIDE_ARGS+=" --noise-samples ${NOISE_SAMPLES}"
+[[ -n "$FT_SOURCE_CLASS"  ]] && OVERRIDE_ARGS+=" --ft-source-class ${FT_SOURCE_CLASS}"
 
 srun python -u src/fashion_mnist_forgetting/fmnist_forgetting.py \
     --config "${CONFIG_FILE}" \

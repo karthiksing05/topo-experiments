@@ -16,8 +16,8 @@ Plots
   9_kl_loss.png                 — KL penalty, pretrain and finetune (topo_sparsity only)
   10_entropy_loss.png           — Entropy penalty, pretrain and finetune (topo_sparsity only)
   11_grad_entropy.png           — Gradient entropy, pretrain and finetune (all variants)
-  12a_auxk_losses.png           — AuxK reconstruction + aux loss (topo_auxk only)
-  12b_auxk_dead_frac.png        — AuxK dead latent fraction (topo_auxk only)
+  12a_auxk_losses.png           — AuxK aux loss (topo_auxk_pooled only)
+  12b_auxk_dead_frac.png        — AuxK dead latent fraction (topo_auxk_pooled only)
 """
 
 import argparse
@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 # Import model + helpers from sibling training module
 _THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_THIS_DIR))
-from fmnist_forgetting import SimpleNN, SimpleNNAuxK, TOPO_LAYER_NAMES
+from fmnist_forgetting import SimpleNN, TOPO_LAYER_NAMES
 try:
     from topoloss.core import find_cortical_sheet_size
 except ImportError:
@@ -50,28 +50,28 @@ except ImportError:
 # Constants (must match fmnist_forgetting.py)
 # ---------------------------------------------------------------------------
 
-VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk"]
-TOPO_VARIANTS   = ["topo_only", "topo_sparsity", "topo_auxk"]
+VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled"]
+TOPO_VARIANTS   = ["topo_only", "topo_sparsity", "topo_auxk_pooled"]
 
 DISPLAY_NAMES = {
-    "baseline":      "Baseline",
-    "topo_only":     "Topo Only",
-    "topo_sparsity": "Topo + Sparsity",
-    "topo_auxk":     "Topo + AuxK",
+    "baseline":         "Baseline",
+    "topo_only":        "Topo Only",
+    "topo_sparsity":    "Topo + Sparsity",
+    "topo_auxk_pooled": "Topo + AuxK (Pooled)",
 }
 
 COLORS = {
-    "baseline":      "#757575",
-    "topo_only":     "#2196f3",
-    "topo_sparsity": "#4caf50",
-    "topo_auxk":     "#ff9800",
+    "baseline":         "#757575",
+    "topo_only":        "#2196f3",
+    "topo_sparsity":    "#4caf50",
+    "topo_auxk_pooled": "#9c27b0",
 }
 
 MARKERS = {
-    "baseline":      "o",
-    "topo_only":     "s",
-    "topo_sparsity": "^",
-    "topo_auxk":     "D",
+    "baseline":         "o",
+    "topo_only":        "s",
+    "topo_sparsity":    "^",
+    "topo_auxk_pooled": "v",
 }
 
 FMNIST_CLASSES = [
@@ -508,66 +508,60 @@ def plot_grad_entropy(data: dict, out_dir: Path):
 
 
 def plot_auxk_losses(data: dict, out_dir: Path):
-    """Plot 12a/12b — AuxK reconstruction + aux loss, and dead latent fraction."""
-    if "topo_auxk" not in data:
-        print("  [SKIP] auxk_losses — no topo_auxk variant")
+    """Plot 12a/12b — AuxK auxiliary loss and dead latent fraction.
+
+    Shows topo_auxk and topo_auxk_pooled together for easy comparison.
+    """
+    auxk_variants = [v for v in ["topo_auxk_pooled"] if v in data]
+    if not auxk_variants:
+        print("  [SKIP] auxk_losses — no auxk variants")
         return
 
-    d = data["topo_auxk"]
-    recon_pre = _get(d, "pretrain_auxk_recon_per_epoch")
-    recon_ft  = _get(d, "ft_auxk_recon_per_epoch")
-    aux_pre   = _get(d, "pretrain_auxk_aux_per_epoch")
-    aux_ft    = _get(d, "ft_auxk_aux_per_epoch")
-    dead_pre  = _get(d, "pretrain_auxk_dead_frac_per_epoch")
-    dead_ft   = _get(d, "ft_auxk_dead_frac_per_epoch")
-
-    color = COLORS["topo_auxk"]
-
-    # 12a: Reconstruction + Aux loss
-    if recon_pre or recon_ft:
-        fig, (ax_pre, ax_ft) = plt.subplots(1, 2, figsize=(12, 4))
-        for ax, recon, aux, phase in [
-            (ax_pre, recon_pre, aux_pre, "Pretraining"),
-            (ax_ft,  recon_ft,  aux_ft,  "Noise-Finetuning"),
-        ]:
-            if recon:
-                ax.plot(_epochs(recon), recon, label="Recon loss", color=color,
-                        linewidth=1.8, marker="D", markersize=3,
-                        markevery=max(1, len(recon) // 15))
+    # 12a: AuxK auxiliary loss
+    fig, (ax_pre, ax_ft) = plt.subplots(1, 2, figsize=(12, 4))
+    for variant in auxk_variants:
+        d = data[variant]
+        aux_pre = _get(d, "pretrain_auxk_aux_per_epoch")
+        aux_ft  = _get(d, "ft_auxk_aux_per_epoch")
+        for ax, aux in [(ax_pre, aux_pre), (ax_ft, aux_ft)]:
             if aux:
-                ax.plot(_epochs(aux), aux, label="Aux loss (dead latents)", color=color,
-                        linewidth=1.8, linestyle="--", marker="x", markersize=4,
+                ax.plot(_epochs(aux), aux, label=DISPLAY_NAMES[variant],
+                        color=COLORS[variant], linewidth=1.8,
+                        marker=MARKERS[variant], markersize=3,
                         markevery=max(1, len(aux) // 15))
-            ax.set_xlabel("Epoch", fontsize=11)
-            ax.set_ylabel("MSE Loss", fontsize=11)
-            ax.set_title(f"{phase} Phase", fontsize=11)
-            _add_legend(ax)
-            _loss_fmt(ax)
-        fig.suptitle("AuxK Losses — Reconstruction + Dead-Latent Auxiliary (Topo + AuxK)", fontsize=12)
-        fig.tight_layout()
-        _save(fig, out_dir / "12a_auxk_losses.png")
+    for ax, phase in [(ax_pre, "Pretraining"), (ax_ft, "Noise-Finetuning")]:
+        ax.set_xlabel("Epoch", fontsize=11)
+        ax.set_ylabel("MSE Loss", fontsize=11)
+        ax.set_title(f"{phase} Phase", fontsize=11)
+        _add_legend(ax)
+        _loss_fmt(ax)
+    fig.suptitle("AuxK Dead-Latent Auxiliary Loss", fontsize=12)
+    fig.tight_layout()
+    _save(fig, out_dir / "12a_auxk_losses.png")
 
     # 12b: Dead latent fraction
-    if dead_pre or dead_ft:
-        fig, (ax_pre, ax_ft) = plt.subplots(1, 2, figsize=(12, 4))
-        for ax, dead, phase in [
-            (ax_pre, dead_pre, "Pretraining"),
-            (ax_ft,  dead_ft,  "Noise-Finetuning"),
-        ]:
+    fig, (ax_pre, ax_ft) = plt.subplots(1, 2, figsize=(12, 4))
+    for variant in auxk_variants:
+        d = data[variant]
+        dead_pre = _get(d, "pretrain_auxk_dead_frac_per_epoch")
+        dead_ft  = _get(d, "ft_auxk_dead_frac_per_epoch")
+        for ax, dead in [(ax_pre, dead_pre), (ax_ft, dead_ft)]:
             if dead:
                 ax.plot(_epochs(dead), [100 * v for v in dead],
-                        label="Dead fraction", color=color,
-                        linewidth=1.8, marker="D", markersize=3,
+                        label=DISPLAY_NAMES[variant],
+                        color=COLORS[variant], linewidth=1.8,
+                        marker=MARKERS[variant], markersize=3,
                         markevery=max(1, len(dead) // 15))
-            ax.set_xlabel("Epoch", fontsize=11)
-            ax.set_ylabel("Dead Latent Fraction (%)", fontsize=11)
-            ax.set_title(f"{phase} Phase", fontsize=11)
-            ax.set_ylim(-5, 105)
-            _add_legend(ax)
-            _loss_fmt(ax)
-        fig.suptitle("AuxK Dead Latent Fraction — Topo + AuxK Variant", fontsize=12)
-        fig.tight_layout()
-        _save(fig, out_dir / "12b_auxk_dead_frac.png")
+    for ax, phase in [(ax_pre, "Pretraining"), (ax_ft, "Noise-Finetuning")]:
+        ax.set_xlabel("Epoch", fontsize=11)
+        ax.set_ylabel("Dead Latent Fraction (%)", fontsize=11)
+        ax.set_title(f"{phase} Phase", fontsize=11)
+        ax.set_ylim(-5, 105)
+        _add_legend(ax)
+        _loss_fmt(ax)
+    fig.suptitle("AuxK Dead Latent Fraction", fontsize=12)
+    fig.tight_layout()
+    _save(fig, out_dir / "12b_auxk_dead_frac.png")
 
 
 # ---------------------------------------------------------------------------
@@ -578,14 +572,27 @@ def plot_auxk_losses(data: dict, out_dir: Path):
 # Model loading helpers
 # ---------------------------------------------------------------------------
 
+def _infer_sparsity_mode(state: dict, hidden_size: int) -> str:
+    """Fallback mode detection for checkpoints that predate sparsity_mode metadata."""
+    if "latent_counts" not in state:
+        return "relu"
+    return "topk_pooled"
+
+
 def _load_model(ckpt_path: Path, device: str, hidden_size: int = 256) -> SimpleNN:
-    """Load a SimpleNN (or SimpleNNAuxK) from a checkpoint file."""
+    """Load a SimpleNN (any sparsity_mode) from a checkpoint."""
     ckpt  = torch.load(ckpt_path, map_location=device)
     state = ckpt.get("model", ckpt)
-    if "fc1_dec.weight" in state:
-        model = SimpleNNAuxK(hidden_size=hidden_size).to(device)
-    else:
-        model = SimpleNN(hidden_size=hidden_size).to(device)
+    hs    = ckpt.get("hidden_size", hidden_size)
+    mode  = ckpt.get("sparsity_mode", _infer_sparsity_mode(state, hs))
+    model = SimpleNN(
+        hidden_size=hs,
+        sparsity_mode=mode,
+        k=ckpt.get("k", 32),
+        k_aux=ckpt.get("k_aux", 64),
+        factor_h=ckpt.get("factor_h") or 4.0,
+        factor_w=ckpt.get("factor_w") or 4.0,
+    ).to(device)
     model.load_state_dict(state)
     model.eval()
     return model

@@ -1,13 +1,15 @@
 {
   "_comment": [
     "Shared config for both experiment scripts in src/fashion_mnist_forgetting/:",
-    "  fmnist_forgetting.py  — full pretrain + noise-finetune forgetting experiment",
+    "  fmnist_forgetting.py  — full pretrain + finetune forgetting experiment",
     "  train_fmnist_topo.py  — pretrain-only run (uses 'epochs' key)",
     "",
     "Top-level keys can be overridden via CLI (e.g. --pretrain-epochs 30).",
     "Per-layer keys (topo_scale, factor_h, …) must be edited here.",
     "noise_target_class: 0=T-shirt, 1=Trouser, 2=Pullover, 3=Dress, 4=Coat,",
-    "                    5=Sandal, 6=Shirt, 7=Sneaker, 8=Bag, 9=AnkleBoot"
+    "                    5=Sandal, 6=Shirt, 7=Sneaker, 8=Bag, 9=AnkleBoot",
+    "ft_source_class:    source class whose real images are used as finetune stimuli",
+    "                    (relabeled as noise_target_class). null = pure-noise mode."
   ],
 
   "data_dir":           null,
@@ -26,9 +28,12 @@
 
   "noise_target_class": 7,
   "noise_samples":      2000,
+  "ft_source_class":    9,
 
-  "auxk_k":             32,
+  "auxk_k":             16,
   "auxk_k_aux":         64,
+  "auxk_k_pooled":      1,
+  "auxk_k_aux_pooled":  4,
 
   "resume_topo":        null,
   "resume_topo_only":   null,
@@ -40,9 +45,9 @@
       "factor_h":        4.0,
       "factor_w":        4.0,
       "lambda_kl":       2.5,
-      "lambda_entropy":  2.0,
+      "lambda_entropy":  5.0,
       "temperature":     1.0,
-      "auxk_alpha":      0.03125,
+      "auxk_alpha":      5.0,
       "dead_threshold":  100
     }
   }

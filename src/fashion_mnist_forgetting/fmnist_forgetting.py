@@ -1,14 +1,18 @@
-"""Fashion-MNIST catastrophic forgetting via pure-noise finetuning.
+"""Fashion-MNIST catastrophic forgetting experiment.
 
 Phase 1  (pretraining):   All 10 FashionMNIST categories, full training set.
-Phase 2  (noise-finetune): Pure Gaussian noise images all labeled as one
-                           target class — maximum distribution-shift probe.
+Phase 2  (finetuning):     A small dataset all labeled as one target class,
+                           either pure Gaussian noise (maximum distribution
+                           shift) or real images from a chosen source class
+                           (class-substitution probe).
 
 Four variants compared:
-  baseline      — cross-entropy only, no regularisation
-  topo_only     — TopoLoss on fc1, no KL / entropy sparsity
-  topo_sparsity — TopoLoss + KL + per-sample entropy on fc1
-  topo_auxk     — TopoLoss + TopK sparsity + AuxK dead-latent revival on fc1
+  baseline         — cross-entropy only, no regularisation
+  topo_only        — TopoLoss on fc1, no KL / entropy sparsity
+  topo_sparsity    — TopoLoss + KL + per-sample entropy on fc1
+  topo_auxk_pooled — TopoLoss + AuxK CE loss on the downsampled cortical sheet;
+                     TopK / dead-tracking on pool_h×pool_w pooled units;
+                     main fc1→fc2 path uses full ReLU activations
 
 Metrics tracked per epoch in both phases:
   ce, topo, kl, entropy, grad_entropy, val_acc (FashionMNIST val, all classes)
@@ -20,7 +24,7 @@ Results saved as:
   outputs/fashion_mnist_forgetting/results/fmnist_forgetting_results_latest.json
   outputs/fashion_mnist_forgetting/results/fmnist_forgetting_results_{timestamp}.json
 
-JSON top-level keys are variant labels ("baseline", "topo_only", "topo_sparsity", "topo_auxk").
+JSON top-level keys are variant labels ("baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled").
 """
 
 # -- Imports -------------------------------------------------------------------
@@ -58,27 +62,27 @@ FMNIST_CLASSES = [
     "Sandal",   "Shirt",   "Sneaker",  "Bag",    "AnkleBoot",
 ]
 
-VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk"]
+VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled"]
 
 DISPLAY_NAMES = {
-    "baseline":      "Baseline",
-    "topo_only":     "Topo Only",
-    "topo_sparsity": "Topo + Sparsity",
-    "topo_auxk":     "Topo + AuxK",
+    "baseline":          "Baseline",
+    "topo_only":         "Topo Only",
+    "topo_sparsity":     "Topo + Sparsity",
+    "topo_auxk_pooled":  "Topo + AuxK (Pooled)",
 }
 
 COLORS = {
-    "baseline":      "#757575",   # gray
-    "topo_only":     "#2196f3",   # blue
-    "topo_sparsity": "#4caf50",   # green
-    "topo_auxk":     "#ff9800",   # orange
+    "baseline":          "#757575",   # gray
+    "topo_only":         "#2196f3",   # blue
+    "topo_sparsity":     "#4caf50",   # green
+    "topo_auxk_pooled":  "#9c27b0",   # purple
 }
 
 MARKERS = {
-    "baseline":      "o",
-    "topo_only":     "s",
-    "topo_sparsity": "^",
-    "topo_auxk":     "D",
+    "baseline":          "o",
+    "topo_only":         "s",
+    "topo_sparsity":     "^",
+    "topo_auxk_pooled":  "v",
 }
 
 # The single fc1 layer that receives TopoLoss + sparsity penalties
@@ -87,96 +91,113 @@ TOPO_LAYER_NAMES = ["fc1"]
 
 # -- Model ---------------------------------------------------------------------
 
-class SimpleNN(nn.Module):
-    """Two-layer MLP matching the demo notebook architecture.
-
-    fc1 receives TopoLoss + KL/entropy sparsity for the topo variants.
-    fc2 is the classifier head, left unconstrained.
-    """
-    def __init__(self, hidden_size: int = 256, bias: bool = False):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.fc1 = nn.Linear(28 * 28, hidden_size, bias=bias)
-        self.fc2 = nn.Linear(hidden_size, 10, bias=bias)
-
-    def forward(self, x):
-        x = x.view(-1, 28 * 28)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)   # logits
-
-
-def _topk_act(pre_acts: torch.Tensor, k: int) -> torch.Tensor:
-    """Top-K activation: keep only the *k* largest (positive) values per row."""
-    _, idx = pre_acts.topk(k, dim=-1)
-    mask = torch.zeros_like(pre_acts, dtype=torch.bool)
+def _topk_act(pre: torch.Tensor, k: int) -> torch.Tensor:
+    """Keep only the *k* largest (positive) pre-activations per row."""
+    _, idx = pre.topk(k, dim=-1)
+    mask = torch.zeros_like(pre, dtype=torch.bool)
     mask.scatter_(1, idx, True)
-    return F.relu(pre_acts) * mask.float()
+    return F.relu(pre) * mask.float()
 
 
-class SimpleNNAuxK(SimpleNN):
-    """SimpleNN with TopK sparsity + AuxK dead-latent revival on fc1.
+class SimpleNN(nn.Module):
+    """Two-layer MLP with centralised support for all four forgetting variants.
 
-    Instead of ReLU + KL/entropy penalties, this variant uses:
-      - TopK: only the *k* largest fc1 pre-activations are kept (rest zeroed)
-      - AuxK: dead latents (those rarely in top-k) are encouraged to
-        reconstruct what the alive latents missed, via a learned decoder.
+    sparsity_mode controls fc1 activation and AuxK dead-latent gating:
+      'relu'        — standard ReLU; baseline / topo_only / topo_sparsity
+      'topk_pooled' — ReLU on main fc1→fc2 path; TopK / dead-tracking on the
+                      spatially-pooled cortical sheet; topo_auxk_pooled
+
+    For the AuxK mode, auxk_loss(labels, criterion, dead_threshold) trains
+    dead latents to classify via CE — no separate decoder needed.
     """
 
     def __init__(
         self,
         hidden_size: int = 256,
+        bias: bool = False,
+        sparsity_mode: str = "relu",
         k: int = 32,
         k_aux: int = 64,
-        bias: bool = False,
+        factor_h: float = 4.0,
+        factor_w: float = 4.0,
     ):
-        super().__init__(hidden_size=hidden_size, bias=bias)
-        self.k = k
+        super().__init__()
+        self.hidden_size   = hidden_size
+        self.sparsity_mode = sparsity_mode
+        self.k     = k
         self.k_aux = k_aux
-        self.fc1_dec = nn.Linear(hidden_size, 28 * 28, bias=bias)
-        self.register_buffer("latent_counts", torch.zeros(hidden_size))
+        self.fc1 = nn.Linear(28 * 28, hidden_size, bias=bias)
+        self.fc2 = nn.Linear(hidden_size, 10,      bias=bias)
+
+        if sparsity_mode == "topk_pooled":
+            size = find_cortical_sheet_size(hidden_size)
+            self.sheet_h   = size.height
+            self.sheet_w   = size.width
+            self.pool_h    = max(1, round(size.height / factor_h))
+            self.pool_w    = max(1, round(size.width  / factor_w))
+            self.pool_size = self.pool_h * self.pool_w
+            self.factor_h  = factor_h
+            self.factor_w  = factor_w
+            self.register_buffer("latent_counts", torch.zeros(self.pool_size))
+
+    def reset_dead_counts(self):
+        if hasattr(self, "latent_counts"):
+            self.latent_counts.zero_()
 
     def forward(self, x):
         x_flat = x.view(-1, 28 * 28)
-        pre_acts = self.fc1(x_flat)
-        topk_acts = _topk_act(pre_acts, self.k)
+        pre    = self.fc1(x_flat)
 
-        # Cache for auxk_loss()
-        self._pre_acts = pre_acts
-        self._x_flat = x_flat
-        self._topk_acts = topk_acts
+        if self.sparsity_mode == "topk_pooled":
+            acts = F.relu(pre)
+            pool = F.adaptive_avg_pool2d(
+                acts.reshape(-1, 1, self.sheet_h, self.sheet_w),
+                (self.pool_h, self.pool_w),
+            ).reshape(-1, self.pool_size)
+            self._pre = pre
+            with torch.no_grad():
+                self.latent_counts += (_topk_act(pool, self.k) > 0).float().sum(0)
 
-        # Running activation counter
-        with torch.no_grad():
-            self.latent_counts += (topk_acts > 0).float().sum(0)
+        else:
+            acts = F.relu(pre)
 
-        return self.fc2(topk_acts)
+        return self.fc2(acts)
 
-    def auxk_loss(self, dead_threshold: int = 100) -> tuple:
-        """Reconstruction + AuxK loss.  Call after ``forward()``.
+    def auxk_loss(
+        self,
+        labels: torch.Tensor,
+        criterion: nn.Module,
+        dead_threshold: int = 100,
+    ) -> tuple:
+        """Classification AuxK loss — call immediately after forward().
 
-        Returns ``(L_recon, L_aux, dead_fraction)``.
+        Dead pooled regions (rarely active) are upsampled to fc1 unit space;
+        the top-k_aux of those fc1 units attempt to classify the batch via CE.
+        Gradients flow through both fc1 (reviving dead units) and fc2.
+
+        Returns (L_aux, dead_fraction).
         """
-        x_hat = self.fc1_dec(self._topk_acts)
-        residual = self._x_flat - x_hat
-        L_recon = (residual ** 2).mean()
-
         dead_mask = self.latent_counts < dead_threshold
         dead_frac = dead_mask.float().mean().item()
 
-        if dead_mask.any():
-            dead_pre = self._pre_acts.clone()
-            dead_pre[:, ~dead_mask] = -torch.inf
-            k_eff = min(self.k_aux, int(dead_mask.sum().item()))
-            if k_eff > 0:
-                aux_acts = _topk_act(dead_pre, k_eff)
-                e_hat = self.fc1_dec(aux_acts)
-                L_aux = ((residual.detach() - e_hat) ** 2).mean()
-            else:
-                L_aux = residual.new_tensor(0.0)
-        else:
-            L_aux = residual.new_tensor(0.0)
+        if not dead_mask.any():
+            return self._pre.new_tensor(0.0), dead_frac
 
-        return L_recon, L_aux, dead_frac
+        # Upsample pool-level dead mask to fc1 unit space
+        dead_spatial  = dead_mask.float().reshape(1, 1, self.pool_h, self.pool_w)
+        dead_fc1_mask = F.interpolate(
+            dead_spatial, (self.sheet_h, self.sheet_w), mode="nearest",
+        ).reshape(self.hidden_size).bool()
+        dead_pre = self._pre.clone()
+        dead_pre[:, ~dead_fc1_mask] = -torch.inf
+        k_eff = min(self.k_aux, int(dead_fc1_mask.sum().item()))
+
+        if k_eff == 0:
+            return self._pre.new_tensor(0.0), dead_frac
+
+        aux_acts = _topk_act(dead_pre, k_eff)
+        L_aux = criterion(self.fc2(aux_acts), labels)
+        return L_aux, dead_frac
 
 
 # -- Losses & metrics ----------------------------------------------------------
@@ -280,9 +301,9 @@ def _variant_config(
     if variant == "baseline":
         return None, None
 
-    # topo_only / topo_auxk: zero out KL and entropy lambdas
+    # topo_only / topo_auxk_pooled: zero out KL and entropy lambdas
     layer_cfg_copy = copy.deepcopy(base_layer_cfg)
-    if variant in ("topo_only", "topo_auxk"):
+    if variant in ("topo_only", "topo_auxk_pooled"):
         for lc in layer_cfg_copy.values():
             lc["lambda_kl"]      = 0.0
             lc["lambda_entropy"] = 0.0
@@ -315,7 +336,7 @@ def run_phase(
     """
     history = {k: [] for k in (
         "ce", "topo", "kl", "entropy", "grad_entropy", "val_acc",
-        "auxk_recon", "auxk_aux", "auxk_dead_frac",
+        "auxk_aux", "auxk_dead_frac",
     )}
 
     # Activation hooks for KL/entropy penalties
@@ -331,9 +352,9 @@ def run_phase(
             hook_handles.append(layer.register_forward_hook(_make_hook(name)))
 
     best_acc = 0.0
-    is_auxk  = isinstance(model, SimpleNNAuxK)
+    is_auxk  = model.sparsity_mode != "relu"
     if is_auxk:
-        model.latent_counts.zero_()
+        model.reset_dead_counts()
 
     for epoch in range(epochs):
         model.train()
@@ -341,7 +362,7 @@ def run_phase(
         sum_kl  = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_ent = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_grad_ent = 0.0
-        sum_auxk_recon = sum_auxk_aux = 0.0
+        sum_auxk_aux = 0.0
         sum_auxk_dead  = 0.0
         n_total = n_steps = 0
 
@@ -360,12 +381,12 @@ def run_phase(
 
                 if is_auxk:
                     lc = layer_cfg[TOPO_LAYER_NAMES[0]]
-                    L_rec, L_aux, d_frac = model.auxk_loss(
-                        int(lc.get("dead_threshold", 100))
+                    L_aux, d_frac = model.auxk_loss(
+                        labels, criterion,
+                        int(lc.get("dead_threshold", 100)),
                     )
                     alpha = float(lc.get("auxk_alpha", 1 / 32))
-                    extra = extra + alpha * (L_rec + L_aux)
-                    sum_auxk_recon += L_rec.item() * imgs.size(0)
+                    extra = extra + alpha * L_aux
                     sum_auxk_aux   += L_aux.item() * imgs.size(0)
                     sum_auxk_dead  += d_frac
                 else:
@@ -414,20 +435,24 @@ def run_phase(
         history["grad_entropy"].append(ge_avg)
         history["val_acc"].append(val_acc)
 
-        auxk_recon_avg = sum_auxk_recon / n_total if n_total else 0.0
         auxk_aux_avg   = sum_auxk_aux   / n_total if n_total else 0.0
         auxk_dead_avg  = sum_auxk_dead  / max(n_steps, 1)
-        history["auxk_recon"].append(auxk_recon_avg)
         history["auxk_aux"].append(auxk_aux_avg)
         history["auxk_dead_frac"].append(auxk_dead_avg)
 
         if ckpt_dir is not None and (phase == "pretrain") and val_acc >= best_acc:
             best_acc = val_acc
             torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "best_acc":  best_acc,
+                "epoch":         epoch,
+                "model":         model.state_dict(),
+                "optimizer":     optimizer.state_dict(),
+                "best_acc":      best_acc,
+                "sparsity_mode": model.sparsity_mode,
+                "k":             model.k,
+                "k_aux":         model.k_aux,
+                "hidden_size":   model.hidden_size,
+                "factor_h":      getattr(model, "factor_h", None),
+                "factor_w":      getattr(model, "factor_w", None),
             }, ckpt_dir / f"best_{phase}_{label}.pt")
 
         if (epoch + 1) % print_freq == 0 or epoch == epochs - 1:
@@ -435,7 +460,7 @@ def run_phase(
                 print(
                     f"  [{label}|{phase}] Epoch [{epoch+1:3d}/{epochs}]  "
                     f"CE={ce_avg:.4f}  Topo={topo_avg:.6f}  "
-                    f"Recon={auxk_recon_avg:.4f}  Aux={auxk_aux_avg:.4f}  "
+                    f"AuxK={auxk_aux_avg:.4f}  "
                     f"Dead={auxk_dead_avg:.1%}  "
                     f"GradH={ge_avg:.4f}  Val={val_acc:.1f}%"
                 )
@@ -454,9 +479,15 @@ def run_phase(
 
     if ckpt_dir is not None:
         torch.save({
-            "epoch":     epochs - 1,
-            "model":     model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "epoch":         epochs - 1,
+            "model":         model.state_dict(),
+            "optimizer":     optimizer.state_dict(),
+            "sparsity_mode": model.sparsity_mode,
+            "k":             model.k,
+            "k_aux":         model.k_aux,
+            "hidden_size":   model.hidden_size,
+            "factor_h":      getattr(model, "factor_h", None),
+            "factor_w":      getattr(model, "factor_w", None),
         }, ckpt_dir / f"last_{phase}_{label}.pt")
 
     for h in hook_handles:
@@ -504,15 +535,29 @@ def train(cfg: dict) -> None:
     val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False, num_workers=2, pin_memory=_pin)
     print(f"FashionMNIST: {len(train_ds):,} train  |  {len(val_ds):,} val  |  10 classes\n")
 
-    # Noise finetune dataset
-    noise_target = int(cfg.get("noise_target_class", 0))
-    n_noise      = int(cfg.get("noise_samples", 2000))
-    print(f"Noise target: class {noise_target} ({FMNIST_CLASSES[noise_target]})  |  {n_noise} samples")
-    # Standard Gaussian noise: distribution maximally different from real images
-    noise_imgs   = torch.randn(n_noise, 1, 28, 28)
-    noise_labels = torch.full((n_noise,), noise_target, dtype=torch.long)
-    noise_ds     = TensorDataset(noise_imgs, noise_labels)
-    noise_loader = DataLoader(noise_ds, batch_size=cfg["batch_size"], shuffle=True)
+    # Finetune dataset
+    ft_target = int(cfg.get("noise_target_class", 0))
+    ft_source = cfg.get("ft_source_class", None)
+    n_ft      = int(cfg.get("noise_samples", 2000))
+    if ft_source is None:
+        # Noise mode: pure Gaussian noise labeled as ft_target
+        ft_imgs     = torch.randn(n_ft, 1, 28, 28)
+        ft_mode_str = "noise"
+    else:
+        # Class-substitution mode: real images from ft_source, relabeled as ft_target
+        ft_source   = int(ft_source)
+        src_indices = [i for i, (_, lbl) in enumerate(train_ds) if int(lbl) == ft_source]
+        rng         = torch.Generator().manual_seed(42)
+        chosen      = torch.randint(len(src_indices), (n_ft,), generator=rng).tolist()
+        ft_imgs     = torch.stack([train_ds[src_indices[i]][0] for i in chosen])
+        ft_mode_str = f"{ft_source} ({FMNIST_CLASSES[ft_source]})"
+    ft_labels  = torch.full((n_ft,), ft_target, dtype=torch.long)
+    ft_ds      = TensorDataset(ft_imgs, ft_labels)
+    ft_loader  = DataLoader(ft_ds, batch_size=cfg["batch_size"], shuffle=True)
+    print(
+        f"Finetune: target={ft_target} ({FMNIST_CLASSES[ft_target]})  "
+        f"source={ft_mode_str}  |  {n_ft} samples"
+    )
     print()
 
     layer_cfg = cfg["layers"]
@@ -527,14 +572,19 @@ def train(cfg: dict) -> None:
 
         # ── Phase 1: Pretrain on FashionMNIST ──────────────────────────────
         print(f"\n  Phase 1: Pretraining on all 10 FashionMNIST classes ({cfg['pretrain_epochs']} epochs)")
-        if variant == "topo_auxk":
-            model = SimpleNNAuxK(
-                hidden_size=cfg.get("hidden_size", 256),
-                k=cfg.get("auxk_k", 32),
-                k_aux=cfg.get("auxk_k_aux", 64),
+        hs = cfg.get("hidden_size", 256)
+        if variant == "topo_auxk_pooled":
+            lc = layer_cfg["fc1"]
+            model = SimpleNN(
+                hidden_size=hs,
+                sparsity_mode="topk_pooled",
+                factor_h=lc.get("factor_h", 4.0),
+                factor_w=lc.get("factor_w", 4.0),
+                k=cfg.get("auxk_k_pooled", 4),
+                k_aux=cfg.get("auxk_k_aux_pooled", 8),
             ).to(device)
         else:
-            model = SimpleNN(hidden_size=cfg.get("hidden_size", 256)).to(device)
+            model = SimpleNN(hidden_size=hs).to(device)
         optimizer  = optim.Adam(model.parameters(), lr=cfg["lr"])
         topo_loss, eff_layer_cfg = _variant_config(model, variant, layer_cfg)
 
@@ -552,14 +602,17 @@ def train(cfg: dict) -> None:
         cls_acc_before      = per_class_accuracy(model, val_loader, device)
         print(f"\n  Pre-finetune val acc: {val_acc_before:.1f}%")
 
-        # ── Phase 2: Finetune on noise ──────────────────────────────────────
-        print(f"\n  Phase 2: Noise finetuning — target class={noise_target} ({FMNIST_CLASSES[noise_target]})  ({cfg['finetune_epochs']} epochs)")
+        # ── Phase 2: Finetune ──────────────────────────────────────────────
+        print(
+            f"\n  Phase 2: Finetuning — target={ft_target} ({FMNIST_CLASSES[ft_target]})  "
+            f"source={ft_mode_str}  ({cfg['finetune_epochs']} epochs)"
+        )
         ft_optimizer = optim.Adam(model.parameters(), lr=cfg["finetune_lr"])
         ft_topo_loss, ft_layer_cfg = _variant_config(model, variant, layer_cfg)
 
         ft_history = run_phase(
             label=variant, phase="finetune",
-            model=model, train_loader=noise_loader, monitor_loader=val_loader,
+            model=model, train_loader=ft_loader, monitor_loader=val_loader,
             criterion=criterion, optimizer=ft_optimizer,
             epochs=cfg["finetune_epochs"], device=device,
             print_freq=cfg["print_freq"],
@@ -588,7 +641,6 @@ def train(cfg: dict) -> None:
             "pretrain_kl_per_epoch":           pretrain_history["kl"],
             "pretrain_entropy_per_epoch":      pretrain_history["entropy"],
             "pretrain_grad_entropy_per_epoch": pretrain_history["grad_entropy"],
-            "pretrain_auxk_recon_per_epoch":   pretrain_history["auxk_recon"],
             "pretrain_auxk_aux_per_epoch":     pretrain_history["auxk_aux"],
             "pretrain_auxk_dead_frac_per_epoch": pretrain_history["auxk_dead_frac"],
             # Loss curves — finetune
@@ -597,12 +649,14 @@ def train(cfg: dict) -> None:
             "ft_kl_per_epoch":                 ft_history["kl"],
             "ft_entropy_per_epoch":            ft_history["entropy"],
             "ft_grad_entropy_per_epoch":       ft_history["grad_entropy"],
-            "ft_auxk_recon_per_epoch":         ft_history["auxk_recon"],
             "ft_auxk_aux_per_epoch":           ft_history["auxk_aux"],
             "ft_auxk_dead_frac_per_epoch":     ft_history["auxk_dead_frac"],
             # Metadata
-            "noise_target_class":              noise_target,
-            "noise_target_name":               FMNIST_CLASSES[noise_target],
+            "ft_target_class":                 ft_target,
+            "ft_target_name":                  FMNIST_CLASSES[ft_target],
+            "ft_source_class":                 ft_source,
+            "ft_source_name":                  FMNIST_CLASSES[ft_source] if ft_source is not None else None,
+            "ft_mode":                         ft_mode_str,
             "config":                          {k: v for k, v in cfg.items() if k != "layers"},
         }
 
@@ -637,8 +691,11 @@ DEFAULT_CFG = {
     "print_freq":         5,
     "noise_target_class": 7,
     "noise_samples":      2000,
+    "ft_source_class":    None,
     "auxk_k":             32,
     "auxk_k_aux":         64,
+    "auxk_k_pooled":      4,
+    "auxk_k_aux_pooled":  8,
     "layers": {
         "fc1": {
             "topo_scale":    10.0,
@@ -676,8 +733,13 @@ def get_config() -> dict:
     p.add_argument("--print-freq",         type=int,   default=None)
     p.add_argument("--noise-target-class", type=int,   default=None)
     p.add_argument("--noise-samples",      type=int,   default=None)
+    p.add_argument("--ft-source-class",    type=int,   default=None,
+                   help="Source class whose images are used as finetune stimuli "
+                        "(relabeled as noise-target-class). Omit for pure-noise mode.")
     p.add_argument("--auxk-k",             type=int,   default=None)
     p.add_argument("--auxk-k-aux",         type=int,   default=None)
+    p.add_argument("--auxk-k-pooled",      type=int,   default=None)
+    p.add_argument("--auxk-k-aux-pooled",  type=int,   default=None)
     cli = p.parse_args()
 
     cfg = copy.deepcopy(DEFAULT_CFG)
@@ -707,8 +769,11 @@ def get_config() -> dict:
         "print_freq":         cli.print_freq,
         "noise_target_class": cli.noise_target_class,
         "noise_samples":      cli.noise_samples,
+        "ft_source_class":    cli.ft_source_class,
         "auxk_k":             cli.auxk_k,
         "auxk_k_aux":         cli.auxk_k_aux,
+        "auxk_k_pooled":      cli.auxk_k_pooled,
+        "auxk_k_aux_pooled":  cli.auxk_k_aux_pooled,
     }
     for k, v in overrides.items():
         if v is not None:
