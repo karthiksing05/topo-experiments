@@ -19,6 +19,21 @@ Why Topographic Sparsity? Most likely to induce better downstream performance fo
 *   By inducing sparsity in regions, we're inducing sparsity in gradients, which will result in sparse representation and robustness of representations!
 *   Useful versus useless polysemanticity!!
 
+## Notes from Nicki!!
+
+*   Nicki's framework is very related to Cobweb and how Cobweb brings about changes
+    *   Possible hypotheses:
+        *   Cobweb has dynamic updates (structure changes)
+        *   Cobweb has sparse updates
+        *   Cobweb has a completely different learning mechanism - not like back prop
+    *   Experiments and results:
+        *   Fixing structure of the tree (fixed branching factor and depth) - no major effect here but slight decrease in performance
+            *   "Of course Cobweb doesn't forget - has all the leaves stored" - this test fixed that
+        *   Sparsity fix - neural network version of Cobweb, Taxonomic Networks, has sparse updates built in through Gumbel-Softmax (approximation to Argmax)
+            *   Forgetting still happened here - most likely the neural networks have something else that covers the effect of sparsity
+        *   Cobweb's coefficient which is 1/N samples seen (more things seen, more stable the updating becomes)
+
+
 # Different way to induce topography?
 
 Immediately, my brain goes to some form of dynamic allocation - we shouldn't be forcing neurons to fit in a box, we should think of topography as allocation. The idea with Topoloss is that we're essentially partitioning the cortical sheet into a grid and trying to make neurons within the box fit with other neurons in the box - however, this says nothing about two given boxes and their similarities

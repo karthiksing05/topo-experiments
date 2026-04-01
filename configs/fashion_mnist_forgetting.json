@@ -26,7 +26,7 @@
   "device":             "cuda:0",
   "print_freq":         5,
 
-  "noise_target_class": 7,
+  "noise_target_class": 0,
   "noise_samples":      2000,
   "ft_source_class":    9,
 
@@ -39,16 +39,22 @@
   "resume_topo_only":   null,
   "resume_base":        null,
 
+  "regionlock_threshold": 0.0625,
+  "ewc_lambda":         400.0,
+  "ewc_n_samples":      2048,
+  "replay_capacity":    500,
+  "replay_batch_size":  32,
   "layers": {
     "fc1": {
       "topo_scale":     10.0,
       "factor_h":        4.0,
       "factor_w":        4.0,
-      "lambda_kl":       2.5,
+      "lambda_kl":       0.1,
       "lambda_entropy":  5.0,
+      "lambda_sim":       0.5,
       "temperature":     1.0,
-      "auxk_alpha":      5.0,
-      "dead_threshold":  100
+      "auxk_alpha":      0.5,
+      "dead_threshold":  20
     }
   }
 }

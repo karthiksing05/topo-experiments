@@ -1,22 +1,22 @@
 #!/bin/bash
 #SBATCH --job-name=fmnist_forgetting
-#SBATCH --account=gts-aivanova7-lab
-#SBATCH -N1 --ntasks-per-node=1
-#SBATCH --mem=16GB
+#SBATCH --account=overcap
+#SBATCH --partition=overcap
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
-#SBATCH -t 4:00:00
-#SBATCH -q inferno
-#SBATCH --gres=gpu:1
-#SBATCH --output=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/fmnist_forgetting-%j.out
-#SBATCH --error=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/fmnist_forgetting-%j.err
+#SBATCH --time=4:00:00
+#SBATCH --qos=short
+#SBATCH --gres=gpu:a40:1
+#SBATCH --output=slurm/slurm_outputs/fmnist_forgetting-%j.out
+#SBATCH --error=slurm/slurm_errors/fmnist_forgetting-%j.err
 
 # -- Environment ---------------------------------------------------------------
-module purge
-source /storage/home/hcoda1/3/ksingara3/scratch/miniconda3/etc/profile.d/conda.sh
-conda deactivate
+source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate topovlm
 
-EXPERIMENT_DIR="/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments"
+EXPERIMENT_DIR="/nethome/ksingara3/flash/topo-experiments"
 HF_CACHE_DIR="${EXPERIMENT_DIR}/huggingfacehub_cache"
 
 export HF_HOME="${HF_CACHE_DIR}"
@@ -33,7 +33,7 @@ fi
 
 echo "=========================================="
 echo "FashionMNIST Catastrophic Forgetting Experiment"
-echo "  baseline | topo_only | topo_sparsity | topo_auxk"
+echo "  baseline | topo_only | topo_sparsity | topo_auxk | topo_regionlock"
 echo "=========================================="
 echo "Job ID : $SLURM_JOB_ID"
 echo "Node   : $SLURM_NODELIST"

@@ -6,10 +6,12 @@ Phase 2  (finetuning):     A small dataset all labeled as one target class,
                            shift) or real images from a chosen source class
                            (class-substitution probe).
 
-Four variants compared:
+Five variants compared:
   baseline         — cross-entropy only, no regularisation
   topo_only        — TopoLoss on fc1, no KL / entropy sparsity
   topo_sparsity    — TopoLoss + KL + per-sample entropy on fc1
+  topo_auxk        — TopoLoss + AuxK CE loss on the full fc1 unit space;
+                     TopK sparsity on all 256 fc1 units; dead units revived via AuxK
   topo_auxk_pooled — TopoLoss + AuxK CE loss on the downsampled cortical sheet;
                      TopK / dead-tracking on pool_h×pool_w pooled units;
                      main fc1→fc2 path uses full ReLU activations
@@ -24,7 +26,7 @@ Results saved as:
   outputs/fashion_mnist_forgetting/results/fmnist_forgetting_results_latest.json
   outputs/fashion_mnist_forgetting/results/fmnist_forgetting_results_{timestamp}.json
 
-JSON top-level keys are variant labels ("baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled").
+JSON top-level keys are variant labels ("baseline", "topo_only", "topo_sparsity", "topo_auxk", "topo_auxk_pooled").
 """
 
 # -- Imports -------------------------------------------------------------------
@@ -62,27 +64,50 @@ FMNIST_CLASSES = [
     "Sandal",   "Shirt",   "Sneaker",  "Bag",    "AnkleBoot",
 ]
 
-VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled"]
+VARIANT_LABELS  = [
+    "baseline",
+    "topo_only", "topo_sparsity", "topo_auxk", "topo_auxk_pooled",
+    "topo_regionlock", "topo_regionlock_pooled",
+    "ewc", "replay", "regionlock_notopo",
+]
 
 DISPLAY_NAMES = {
     "baseline":          "Baseline",
     "topo_only":         "Topo Only",
     "topo_sparsity":     "Topo + Sparsity",
+    "topo_auxk":         "Topo + AuxK",
     "topo_auxk_pooled":  "Topo + AuxK (Pooled)",
+    "topo_regionlock":        "Topo + RegionLock",
+    "topo_regionlock_pooled": "Topo + RegionLock (Pooled)",
+    "ewc":                    "EWC",
+    "replay":            "Replay Buffer",
+    "regionlock_notopo": "RegionLock (no Topo)",
 }
 
 COLORS = {
     "baseline":          "#757575",   # gray
     "topo_only":         "#2196f3",   # blue
     "topo_sparsity":     "#4caf50",   # green
+    "topo_auxk":         "#ff5722",   # deep orange
     "topo_auxk_pooled":  "#9c27b0",   # purple
+    "topo_regionlock":        "#e91e63",   # pink
+    "topo_regionlock_pooled": "#3f51b5",   # indigo
+    "ewc":                    "#00bcd4",   # cyan
+    "replay":            "#ff9800",   # amber
+    "regionlock_notopo": "#795548",   # brown
 }
 
 MARKERS = {
     "baseline":          "o",
     "topo_only":         "s",
     "topo_sparsity":     "^",
+    "topo_auxk":         "D",
     "topo_auxk_pooled":  "v",
+    "topo_regionlock":        "P",
+    "topo_regionlock_pooled": "<",
+    "ewc":                    "X",
+    "replay":            "*",
+    "regionlock_notopo": "h",
 }
 
 # The single fc1 layer that receives TopoLoss + sparsity penalties
@@ -93,6 +118,7 @@ TOPO_LAYER_NAMES = ["fc1"]
 
 def _topk_act(pre: torch.Tensor, k: int) -> torch.Tensor:
     """Keep only the *k* largest (positive) pre-activations per row."""
+    k = max(1, min(int(k), pre.shape[-1]))
     _, idx = pre.topk(k, dim=-1)
     mask = torch.zeros_like(pre, dtype=torch.bool)
     mask.scatter_(1, idx, True)
@@ -100,14 +126,15 @@ def _topk_act(pre: torch.Tensor, k: int) -> torch.Tensor:
 
 
 class SimpleNN(nn.Module):
-    """Two-layer MLP with centralised support for all four forgetting variants.
+    """Two-layer MLP with centralised support for all five forgetting variants.
 
     sparsity_mode controls fc1 activation and AuxK dead-latent gating:
       'relu'        — standard ReLU; baseline / topo_only / topo_sparsity
+      'topk'        — TopK on the full fc1 unit space; topo_auxk
       'topk_pooled' — ReLU on main fc1→fc2 path; TopK / dead-tracking on the
                       spatially-pooled cortical sheet; topo_auxk_pooled
 
-    For the AuxK mode, auxk_loss(labels, criterion, dead_threshold) trains
+    For the AuxK modes, auxk_loss(labels, criterion, dead_threshold) trains
     dead latents to classify via CE — no separate decoder needed.
     """
 
@@ -139,6 +166,8 @@ class SimpleNN(nn.Module):
             self.factor_h  = factor_h
             self.factor_w  = factor_w
             self.register_buffer("latent_counts", torch.zeros(self.pool_size))
+        elif sparsity_mode == "topk":
+            self.register_buffer("latent_counts", torch.zeros(hidden_size))
 
     def reset_dead_counts(self):
         if hasattr(self, "latent_counts"):
@@ -149,17 +178,36 @@ class SimpleNN(nn.Module):
         pre    = self.fc1(x_flat)
 
         if self.sparsity_mode == "topk_pooled":
-            acts = F.relu(pre)
+            relu_acts = F.relu(pre)
             pool = F.adaptive_avg_pool2d(
-                acts.reshape(-1, 1, self.sheet_h, self.sheet_w),
+                relu_acts.reshape(-1, 1, self.sheet_h, self.sheet_w),
                 (self.pool_h, self.pool_w),
             ).reshape(-1, self.pool_size)
+            pool_topk = _topk_act(pool, self.k)
+            # Project sparse pooled regions back to fc1 space to enforce
+            # region-level sparsity on the main classification pathway.
+            gate = F.interpolate(
+                (pool_topk > 0).float().reshape(-1, 1, self.pool_h, self.pool_w),
+                (self.sheet_h, self.sheet_w),
+                mode="nearest",
+            ).reshape(-1, self.hidden_size)
+            acts = relu_acts * gate
             self._pre = pre
             with torch.no_grad():
-                self.latent_counts += (_topk_act(pool, self.k) > 0).float().sum(0)
+                self.latent_counts += (pool_topk > 0).float().sum(0)
+
+        elif self.sparsity_mode == "topk":
+            acts = _topk_act(pre, self.k)
+            self._pre = pre
+            with torch.no_grad():
+                self.latent_counts += (acts > 0).float().sum(0)
 
         else:
             acts = F.relu(pre)
+
+        # Store post-activation (post-ReLU/TopK) for activation-entropy tracking.
+        # Use detach() so this never accumulates into the computation graph.
+        self._fc1_acts = acts.detach()
 
         return self.fc2(acts)
 
@@ -183,11 +231,15 @@ class SimpleNN(nn.Module):
         if not dead_mask.any():
             return self._pre.new_tensor(0.0), dead_frac
 
-        # Upsample pool-level dead mask to fc1 unit space
-        dead_spatial  = dead_mask.float().reshape(1, 1, self.pool_h, self.pool_w)
-        dead_fc1_mask = F.interpolate(
-            dead_spatial, (self.sheet_h, self.sheet_w), mode="nearest",
-        ).reshape(self.hidden_size).bool()
+        if self.sparsity_mode == "topk_pooled":
+            # Upsample pool-level dead mask to fc1 unit space
+            dead_spatial  = dead_mask.float().reshape(1, 1, self.pool_h, self.pool_w)
+            dead_fc1_mask = F.interpolate(
+                dead_spatial, (self.sheet_h, self.sheet_w), mode="nearest",
+            ).reshape(self.hidden_size).bool()
+        else:  # topk — latent_counts is already at fc1 unit resolution
+            dead_fc1_mask = dead_mask
+
         dead_pre = self._pre.clone()
         dead_pre[:, ~dead_fc1_mask] = -torch.inf
         k_eff = min(self.k_aux, int(dead_fc1_mask.sum().item()))
@@ -200,6 +252,213 @@ class SimpleNN(nn.Module):
         return L_aux, dead_frac
 
 
+# -- Region locking ------------------------------------------------------------
+
+
+class CorticalRegionLock:
+    """Lock activated cortical regions after each task to prevent forgetting.
+
+    After training on a task, compute the mean post-activation magnitude for
+    each hidden unit, threshold to identify "occupied" units, and freeze their
+    incoming (fc1) and outgoing (fc2) weights during subsequent tasks by zeroing
+    their gradients after backward().
+    """
+
+    def __init__(self, hidden_size: int = 256, threshold: float = 0.1,
+                 factor_h: float | None = None, factor_w: float | None = None):
+        self.hidden_size = hidden_size
+        self.threshold = threshold
+        self.factor_h = factor_h
+        self.factor_w = factor_w
+        # Cumulative mask: True = locked (frozen for future tasks)
+        self.locked_mask = torch.zeros(hidden_size, dtype=torch.bool)
+        self.task_heatmaps: list[torch.Tensor] = []
+
+    @torch.no_grad()
+    def compute_activation_heatmap(
+        self,
+        model: SimpleNN,
+        loader: DataLoader,
+        device: str,
+    ) -> torch.Tensor:
+        """Mean activation magnitude per hidden unit over the dataset.
+
+        Returns a (hidden_size,) tensor of normalised activation magnitudes.
+        """
+        model.eval()
+        accum = torch.zeros(self.hidden_size, device=device)
+        n_total = 0
+        for imgs, labels in loader:
+            imgs = imgs.to(device)
+            _ = model(imgs)
+            acts = model._fc1_acts  # (B, hidden_size), post-ReLU/TopK
+            accum += acts.abs().sum(dim=0)
+            n_total += imgs.size(0)
+        model.train()
+        heatmap = accum / max(n_total, 1)
+        # Normalise to [0, 1]
+        hmax = heatmap.max()
+        if hmax > 0:
+            heatmap = heatmap / hmax
+        return heatmap
+
+    def update_masks(
+        self,
+        model: SimpleNN,
+        loader: DataLoader,
+        device: str,
+    ) -> None:
+        """Compute heatmap on current task data and lock active regions.
+
+        If *factor_h* / *factor_w* were supplied at construction, the heatmap
+        is spatially pooled to region granularity before thresholding and then
+        upsampled back, so that whole cortical tiles are locked atomically.
+        """
+        heatmap = self.compute_activation_heatmap(model, loader, device)
+        heatmap_cpu = heatmap.cpu()
+        self.task_heatmaps.append(heatmap_cpu)
+        if self.factor_h is not None and self.factor_w is not None:
+            size = find_cortical_sheet_size(self.hidden_size)
+            H, W = size.height, size.width
+            H_d = max(1, round(H / self.factor_h))
+            W_d = max(1, round(W / self.factor_w))
+            pooled = F.adaptive_avg_pool2d(
+                heatmap_cpu.reshape(1, 1, H, W), (H_d, W_d)
+            )
+            newly_locked = F.interpolate(
+                (pooled >= self.threshold).float(), (H, W), mode="nearest",
+            ).reshape(self.hidden_size).bool()
+        else:
+            newly_locked = heatmap_cpu >= self.threshold
+        self.locked_mask = self.locked_mask | newly_locked
+
+    def apply_gradient_masks(self, model: SimpleNN) -> None:
+        """Zero gradients for locked hidden units in fc1 and fc2."""
+        if not self.locked_mask.any():
+            return
+        dev_mask = self.locked_mask.to(model.fc1.weight.device)
+        # fc1.weight is (hidden_size, 784) — lock rows for occupied units
+        if model.fc1.weight.grad is not None:
+            model.fc1.weight.grad[dev_mask, :] = 0.0
+        # fc2.weight is (10, hidden_size) — lock columns for occupied units
+        if model.fc2.weight.grad is not None:
+            model.fc2.weight.grad[:, dev_mask] = 0.0
+
+    @property
+    def fraction_locked(self) -> float:
+        return self.locked_mask.float().mean().item()
+
+
+# -- EWC -----------------------------------------------------------------------
+
+
+class EWC:
+    """Elastic Weight Consolidation (Kirkpatrick et al., 2017).
+
+    After each task, estimate the diagonal Fisher information matrix over the
+    current parameters and store the current weights as reference.  During
+    subsequent tasks an L2 penalty weighted by the Fisher diagonal is added:
+
+        L_ewc = (lambda_ewc / 2) * sum_i F_i * (theta_i - theta*_i)^2
+    """
+
+    def __init__(self, model: nn.Module, lambda_ewc: float = 400.0):
+        self.lambda_ewc = lambda_ewc
+        # List of (fisher_diag, reference_params) pairs — one per consolidated task
+        self._tasks: list[tuple[list[torch.Tensor], list[torch.Tensor]]] = []
+
+    def consolidate(
+        self,
+        model: nn.Module,
+        loader: DataLoader,
+        criterion: nn.Module,
+        device: str,
+        n_samples: int = 1024,
+    ) -> None:
+        """Compute Fisher diagonal on *loader* and store current weights."""
+        model.eval()
+        fisher = [torch.zeros_like(p) for p in model.parameters()]
+        n_seen = 0
+        for imgs, labels in loader:
+            if n_seen >= n_samples:
+                break
+            imgs, labels = imgs.to(device), labels.to(device)
+            model.zero_grad()
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+            loss.backward()
+            for f, p in zip(fisher, model.parameters()):
+                if p.grad is not None:
+                    f += p.grad.detach().pow(2) * imgs.size(0)
+            n_seen += imgs.size(0)
+        n_seen = max(n_seen, 1)
+        fisher = [f / n_seen for f in fisher]
+        ref    = [p.detach().clone() for p in model.parameters()]
+        self._tasks.append((fisher, ref))
+        model.train()
+
+    def penalty(self, model: nn.Module) -> torch.Tensor:
+        """Return the total EWC penalty term (scalar tensor)."""
+        if not self._tasks:
+            return next(model.parameters()).new_tensor(0.0)
+        loss = next(model.parameters()).new_tensor(0.0)
+        for fisher_list, ref_list in self._tasks:
+            for f, ref, p in zip(fisher_list, ref_list, model.parameters()):
+                loss = loss + (f.to(p.device) * (p - ref.to(p.device)).pow(2)).sum()
+        return (self.lambda_ewc / 2.0) * loss
+
+
+# -- Replay buffer -------------------------------------------------------------
+
+
+class ReplayBuffer:
+    """Fixed-size reservoir replay buffer for continual learning.
+
+    Samples from past tasks are stored as (image, label) pairs using
+    reservoir sampling so that all seen samples have equal probability of
+    being retained.  At each training step a mini-batch of size
+    *replay_batch_size* is mixed in and trained on jointly.
+    """
+
+    def __init__(self, capacity: int = 500, replay_batch_size: int = 32):
+        self.capacity          = capacity
+        self.replay_batch_size = replay_batch_size
+        self._imgs:   list[torch.Tensor] = []
+        self._labels: list[int]          = []
+        self._n_seen: int                = 0  # total samples seen (for reservoir)
+
+    def add_from_loader(self, loader: DataLoader, max_samples: int | None = None) -> None:
+        """Add samples from *loader* using reservoir sampling."""
+        for imgs, labels in loader:
+            for img, lbl in zip(imgs, labels):
+                self._n_seen += 1
+                if max_samples is not None and self._n_seen > max_samples:
+                    break
+                if len(self._imgs) < self.capacity:
+                    self._imgs.append(img.cpu())
+                    self._labels.append(int(lbl))
+                else:
+                    # Reservoir: replace with probability capacity / n_seen
+                    idx = int(torch.randint(self._n_seen, (1,)).item())
+                    if idx < self.capacity:
+                        self._imgs[idx]   = img.cpu()
+                        self._labels[idx] = int(lbl)
+
+    def sample_batch(self, device: str) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Sample a random mini-batch; returns None if buffer is empty."""
+        n = len(self._imgs)
+        if n == 0:
+            return None
+        k   = min(self.replay_batch_size, n)
+        idx = torch.randperm(n)[:k].tolist()
+        imgs   = torch.stack([self._imgs[i]   for i in idx]).to(device)
+        labels = torch.tensor([self._labels[i] for i in idx], device=device)
+        return imgs, labels
+
+    def __len__(self) -> int:
+        return len(self._imgs)
+
+
 # -- Losses & metrics ----------------------------------------------------------
 
 def cortical_sparsity_losses(
@@ -208,7 +467,12 @@ def cortical_sparsity_losses(
     factor_w: float,
     temperature: float = 3.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """KL-from-uniform + per-sample entropy on the downsampled cortical sheet."""
+    """KL-from-uniform + per-sample entropy on downsampled post-activation sheet.
+
+    Uses non-negative pooled activations with L1 normalisation (no softmax).
+    This preserves true zeros from ReLU/TopK so entropy minimisation directly
+    rewards sparse cortical activation.
+    """
     if activations.ndim == 4:
         activations = activations.mean(dim=(2, 3))
 
@@ -221,14 +485,63 @@ def cortical_sparsity_losses(
     flat   = F.adaptive_avg_pool2d(sheet, (H_d, W_d)).reshape(B, -1)
     M      = flat.shape[1]
 
-    probs      = F.softmax(flat / temperature, dim=-1)
-    batch_mean = probs.mean(dim=0)
-    kl_loss     = F.kl_div(
-        torch.full_like(batch_mean, -math.log(M)),
-        batch_mean, reduction="sum",
+    mags = flat.clamp(min=0.0)
+    totals = mags.sum(dim=-1, keepdim=True)
+    uniform = torch.full_like(mags, 1.0 / M)
+    probs = torch.where(
+        totals > 0,
+        mags / totals.clamp(min=1e-10),
+        uniform,
     )
+    batch_mean = probs.mean(dim=0)
+    # D_KL(batch_mean || Uniform) = log(M) + sum_i p_i log p_i
+    kl_loss = math.log(M) + (batch_mean * (batch_mean + 1e-10).log()).sum()
     entropy_loss = -(probs * (probs + 1e-10).log()).sum(dim=-1).mean()
     return kl_loss, entropy_loss
+
+
+def cortical_similarity_loss(
+    activations: torch.Tensor,
+    factor_h: float,
+    factor_w: float,
+) -> torch.Tensor:
+    """Pairwise cosine-similarity penalty between pooled cortical regions.
+
+    Discourages representational redundancy: if two spatially separated regions
+    respond to the same inputs (high cosine similarity of their activation
+    vectors across the batch), a gradient is produced to push them apart.
+
+    Concretely, for the M downsampled (pooled) regions:
+      1. Form the region activation matrix R of shape (M, B).
+      2. L2-normalise each row across the batch dimension.
+      3. Compute the (M×M) cosine-similarity matrix S = R_norm R_norm^T.
+      4. Return the mean squared off-diagonal element of S.
+
+    A value of 0 = all regions respond to completely different inputs
+    (ideal).  A value of 1 = all regions are identical.
+    """
+    if activations.ndim == 4:
+        activations = activations.mean(dim=(2, 3))
+
+    B, N   = activations.shape
+    size   = find_cortical_sheet_size(N)
+    H, W   = size.height, size.width
+    sheet  = activations.reshape(B, 1, H, W)
+    H_d    = max(1, round(H / factor_h))
+    W_d    = max(1, round(W / factor_w))
+    flat   = F.adaptive_avg_pool2d(sheet, (H_d, W_d)).reshape(B, -1)  # (B, M)
+    M      = flat.shape[1]
+
+    if M < 2:
+        return flat.new_tensor(0.0)
+
+    region_vecs = flat.T                                                # (M, B)
+    norms       = region_vecs.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    normed      = region_vecs / norms                                   # (M, B)
+    sim_matrix  = normed @ normed.T                                     # (M, M)
+    # Exclude diagonal (self-similarity = 1 by construction)
+    mask = ~torch.eye(M, dtype=torch.bool, device=flat.device)
+    return sim_matrix[mask].pow(2).mean()
 
 
 def _grad_entropy(model: nn.Module, params=None) -> float:
@@ -252,6 +565,45 @@ def _grad_entropy(model: nn.Module, params=None) -> float:
         h = -(prob * (prob + 1e-10).log()).sum().item()
         entropies.append(h / math.log(g.numel()))
     return float(sum(entropies) / len(entropies)) if entropies else 0.0
+
+
+@torch.no_grad()
+def _activation_entropy(acts: "torch.Tensor | None") -> float:
+    """Normalised Shannon entropy of post-activation magnitudes on the cortical sheet.
+
+    Accepts the **post-activation** fc1 output stored as ``model._fc1_acts``
+    (set in ``SimpleNN.forward()`` after ReLU / TopK, before fc2).  Using the
+    post-activation tensor — not the raw pre-activation hook output — correctly
+    reflects the sparsity of the representation that fc2 actually sees:
+
+    * ReLU zeroes all negative pre-activations; ~50 % of units are silent.
+    * TopK(k) zeroes all but k units; sparsity = k / N.
+    * A pre-activation linear output has both signs and no zeros, so
+      its L1-entropy is always near 1.0 regardless of sparsity constraints.
+
+    Entropy is computed per sample and averaged over the batch.  Zero-valued
+    units contribute zero probability mass (truly sparse = rewarded).
+
+    Interpretation:
+        1.0 = perfectly uniform / dense (all units equally active)
+        0.0 = single-unit spike (maximally sparse)
+    """
+    if acts is None:
+        return 0.0
+    a = acts.detach().float()
+    if a.ndim == 4:
+        a = a.mean(dim=(2, 3))  # (B, C) — conv layers
+    # a is (B, N) — entropy over post-activation magnitudes
+    mags   = a.abs()                                    # (B, N)
+    totals = mags.sum(dim=-1, keepdim=True)             # (B, 1)
+    valid  = (totals.squeeze(-1) > 0) & (a.shape[1] >= 2)
+    if not valid.any():
+        return 0.0
+    mags   = mags[valid]
+    totals = totals[valid]
+    prob   = mags / totals.clamp(min=1e-10)             # (B_valid, N)
+    h      = -(prob * (prob + 1e-10).log()).sum(dim=-1)  # (B_valid,)
+    return (h / math.log(a.shape[1])).mean().item()
 
 
 @torch.no_grad()
@@ -298,15 +650,18 @@ def _variant_config(
     base_layer_cfg: dict,
 ) -> tuple:
     """Return (topo_loss, layer_cfg) for each variant."""
-    if variant == "baseline":
+    if variant in ("baseline", "ewc", "replay", "regionlock_notopo"):
         return None, None
 
-    # topo_only / topo_auxk_pooled: zero out KL and entropy lambdas
+    # topo_only / topo_auxk / topo_auxk_pooled: zero out KL and entropy lambdas
     layer_cfg_copy = copy.deepcopy(base_layer_cfg)
-    if variant in ("topo_only", "topo_auxk_pooled"):
+    if variant in ("topo_only", "topo_auxk", "topo_auxk_pooled"):
         for lc in layer_cfg_copy.values():
             lc["lambda_kl"]      = 0.0
             lc["lambda_entropy"] = 0.0
+
+    # topo_regionlock uses TopoLoss + KL + entropy (like topo_sparsity)
+    # Region locking is handled externally via CorticalRegionLock
 
     return _build_topo_loss(model, base_layer_cfg), layer_cfg_copy
 
@@ -325,6 +680,9 @@ def run_phase(
     topo_loss=None,
     layer_cfg: dict = None,
     ckpt_dir: Path = None,
+    region_locker: "CorticalRegionLock | None" = None,
+    ewc: "EWC | None" = None,
+    replay_buffer: "ReplayBuffer | None" = None,
 ) -> dict:
     """Run one training phase; return per-epoch loss/metric histories.
 
@@ -335,21 +693,9 @@ def run_phase(
     Each value is a list[float] of length *epochs*.
     """
     history = {k: [] for k in (
-        "ce", "topo", "kl", "entropy", "grad_entropy", "val_acc",
+        "ce", "topo", "kl", "entropy", "sim", "grad_entropy", "val_acc",
         "auxk_aux", "auxk_dead_frac",
     )}
-
-    # Activation hooks for KL/entropy penalties
-    act_store: dict = {n: None for n in TOPO_LAYER_NAMES}
-    hook_handles: list = []
-    if topo_loss is not None:
-        for name in TOPO_LAYER_NAMES:
-            layer = getattr(model, name)
-            def _make_hook(n):
-                def _h(_m, _i, out):
-                    act_store[n] = out
-                return _h
-            hook_handles.append(layer.register_forward_hook(_make_hook(name)))
 
     best_acc = 0.0
     is_auxk  = model.sparsity_mode != "relu"
@@ -361,6 +707,7 @@ def run_phase(
         sum_ce = sum_topo = 0.0
         sum_kl  = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_ent = {n: 0.0 for n in TOPO_LAYER_NAMES}
+        sum_sim = {n: 0.0 for n in TOPO_LAYER_NAMES}
         sum_grad_ent = 0.0
         sum_auxk_aux = 0.0
         sum_auxk_dead  = 0.0
@@ -374,6 +721,8 @@ def run_phase(
             ce     = criterion(logits, labels)
 
             extra = torch.zeros(1, device=device)
+            if ewc is not None:
+                extra = extra + ewc.penalty(model)
             if topo_loss is not None:
                 topo     = topo_loss.compute(model=model, reduce_mean=True)
                 sum_topo += topo.item() * imgs.size(0)
@@ -390,21 +739,42 @@ def run_phase(
                     sum_auxk_aux   += L_aux.item() * imgs.size(0)
                     sum_auxk_dead  += d_frac
                 else:
-                    for name in TOPO_LAYER_NAMES:
-                        act = act_store[name]
-                        if act is not None:
-                            lc = layer_cfg[name]
-                            kl, ent = cortical_sparsity_losses(
-                                act, lc["factor_h"], lc["factor_w"],
-                                lc.get("temperature", 3.0),
+                    act = getattr(model, "_fc1_acts", None)
+                    if act is not None:
+                        lc = layer_cfg["fc1"]
+                        kl, ent = cortical_sparsity_losses(
+                            act, lc["factor_h"], lc["factor_w"],
+                            lc.get("temperature", 3.0),
+                        )
+                        extra = extra + lc["lambda_kl"] * kl + lc["lambda_entropy"] * ent
+                        sum_kl["fc1"] += kl.item() * imgs.size(0)
+                        sum_ent["fc1"] += ent.item() * imgs.size(0)
+                        lambda_sim = float(lc.get("lambda_sim", 0.0))
+                        if lambda_sim > 0.0:
+                            sim = cortical_similarity_loss(
+                                act, lc["factor_h"], lc["factor_w"]
                             )
-                            extra    = extra + lc["lambda_kl"] * kl + lc["lambda_entropy"] * ent
-                            sum_kl[name]  += kl.item()  * imgs.size(0)
-                            sum_ent[name] += ent.item() * imgs.size(0)
+                            extra           = extra + lambda_sim * sim
+                            sum_sim["fc1"] += sim.item() * imgs.size(0)
 
             (ce + extra).backward()
+            if region_locker is not None:
+                region_locker.apply_gradient_masks(model)
             sum_grad_ent += _grad_entropy(model)
             optimizer.step()
+
+            # ── Replay: train on a buffered mini-batch separately ──────────
+            if replay_buffer is not None and len(replay_buffer) > 0:
+                rb = replay_buffer.sample_batch(device)
+                if rb is not None:
+                    r_imgs, r_labels = rb
+                    optimizer.zero_grad(set_to_none=True)
+                    r_loss = criterion(model(r_imgs), r_labels)
+                    # Also add EWC penalty on the replay pass if both active
+                    if ewc is not None:
+                        r_loss = r_loss + ewc.penalty(model)
+                    r_loss.backward()
+                    optimizer.step()
 
             bs       = imgs.size(0)
             sum_ce  += ce.item() * bs
@@ -426,12 +796,14 @@ def run_phase(
         topo_avg = sum_topo / n_total
         kl_avg   = sum(sum_kl[n]  for n in TOPO_LAYER_NAMES) / n_total
         ent_avg  = sum(sum_ent[n] for n in TOPO_LAYER_NAMES) / n_total
+        sim_avg  = sum(sum_sim[n] for n in TOPO_LAYER_NAMES) / n_total
         ge_avg   = sum_grad_ent / max(n_steps, 1)
 
         history["ce"].append(ce_avg)
         history["topo"].append(topo_avg)
         history["kl"].append(kl_avg)
         history["entropy"].append(ent_avg)
+        history["sim"].append(sim_avg)
         history["grad_entropy"].append(ge_avg)
         history["val_acc"].append(val_acc)
 
@@ -468,7 +840,7 @@ def run_phase(
                 print(
                     f"  [{label}|{phase}] Epoch [{epoch+1:3d}/{epochs}]  "
                     f"CE={ce_avg:.4f}  Topo={topo_avg:.6f}  "
-                    f"KL={kl_avg:.4f}  Ent={ent_avg:.4f}  "
+                    f"KL={kl_avg:.4f}  Ent={ent_avg:.4f}  Sim={sim_avg:.4f}  "
                     f"GradH={ge_avg:.4f}  Val={val_acc:.1f}%"
                 )
             else:
@@ -489,9 +861,6 @@ def run_phase(
             "factor_h":      getattr(model, "factor_h", None),
             "factor_w":      getattr(model, "factor_w", None),
         }, ckpt_dir / f"last_{phase}_{label}.pt")
-
-    for h in hook_handles:
-        h.remove()
 
     return history
 
@@ -583,6 +952,13 @@ def train(cfg: dict) -> None:
                 k=cfg.get("auxk_k_pooled", 4),
                 k_aux=cfg.get("auxk_k_aux_pooled", 8),
             ).to(device)
+        elif variant == "topo_auxk":
+            model = SimpleNN(
+                hidden_size=hs,
+                sparsity_mode="topk",
+                k=cfg.get("auxk_k", 32),
+                k_aux=cfg.get("auxk_k_aux", 64),
+            ).to(device)
         else:
             model = SimpleNN(hidden_size=hs).to(device)
         optimizer  = optim.Adam(model.parameters(), lr=cfg["lr"])
@@ -602,6 +978,42 @@ def train(cfg: dict) -> None:
         cls_acc_before      = per_class_accuracy(model, val_loader, device)
         print(f"\n  Pre-finetune val acc: {val_acc_before:.1f}%")
 
+        # ── EWC: consolidate Fisher on pretrain data before finetune ───────
+        ewc_obj = None
+        if variant == "ewc":
+            lambda_ewc = float(cfg.get("ewc_lambda", 400.0))
+            ewc_obj = EWC(model, lambda_ewc=lambda_ewc)
+            ewc_obj.consolidate(model, train_loader, criterion, device,
+                                n_samples=int(cfg.get("ewc_n_samples", 2048)))
+            print(f"  EWC: Fisher consolidated (lambda={lambda_ewc})")
+
+        # ── Replay: fill buffer with pretrain data before finetune ─────────
+        replay_buf = None
+        if variant == "replay":
+            capacity  = int(cfg.get("replay_capacity", 500))
+            rb_batch  = int(cfg.get("replay_batch_size", 32))
+            replay_buf = ReplayBuffer(capacity=capacity, replay_batch_size=rb_batch)
+            replay_buf.add_from_loader(train_loader)
+            print(f"  Replay buffer: {len(replay_buf)} samples stored")
+
+        # ── Region locking (topo_regionlock and regionlock_notopo) ─────────
+        locker = None
+        if variant in ("topo_regionlock", "regionlock_notopo"):
+            threshold = float(cfg.get("regionlock_threshold", 0.1))
+            locker = CorticalRegionLock(hidden_size=hs, threshold=threshold)
+            locker.update_masks(model, train_loader, device)
+            print(f"  RegionLock: {locker.fraction_locked:.1%} of units locked (threshold={threshold})")
+        elif variant == "topo_regionlock_pooled":
+            threshold = float(cfg.get("regionlock_threshold", 0.1))
+            lc = layer_cfg["fc1"]
+            locker = CorticalRegionLock(
+                hidden_size=hs, threshold=threshold,
+                factor_h=lc.get("factor_h", 4.0),
+                factor_w=lc.get("factor_w", 4.0),
+            )
+            locker.update_masks(model, train_loader, device)
+            print(f"  RegionLock (pooled): {locker.fraction_locked:.1%} of units locked (threshold={threshold})")
+
         # ── Phase 2: Finetune ──────────────────────────────────────────────
         print(
             f"\n  Phase 2: Finetuning — target={ft_target} ({FMNIST_CLASSES[ft_target]})  "
@@ -618,6 +1030,9 @@ def train(cfg: dict) -> None:
             print_freq=cfg["print_freq"],
             topo_loss=ft_topo_loss, layer_cfg=ft_layer_cfg,
             ckpt_dir=ckpt_dir,
+            region_locker=locker,
+            ewc=ewc_obj,
+            replay_buffer=replay_buf,
         )
 
         val_acc_after  = ft_history["val_acc"][-1]
@@ -640,6 +1055,7 @@ def train(cfg: dict) -> None:
             "pretrain_topo_per_epoch":         pretrain_history["topo"],
             "pretrain_kl_per_epoch":           pretrain_history["kl"],
             "pretrain_entropy_per_epoch":      pretrain_history["entropy"],
+            "pretrain_sim_per_epoch":          pretrain_history["sim"],
             "pretrain_grad_entropy_per_epoch": pretrain_history["grad_entropy"],
             "pretrain_auxk_aux_per_epoch":     pretrain_history["auxk_aux"],
             "pretrain_auxk_dead_frac_per_epoch": pretrain_history["auxk_dead_frac"],
@@ -648,6 +1064,7 @@ def train(cfg: dict) -> None:
             "ft_topo_per_epoch":               ft_history["topo"],
             "ft_kl_per_epoch":                 ft_history["kl"],
             "ft_entropy_per_epoch":            ft_history["entropy"],
+            "ft_sim_per_epoch":                ft_history["sim"],
             "ft_grad_entropy_per_epoch":       ft_history["grad_entropy"],
             "ft_auxk_aux_per_epoch":           ft_history["auxk_aux"],
             "ft_auxk_dead_frac_per_epoch":     ft_history["auxk_dead_frac"],
@@ -692,20 +1109,26 @@ DEFAULT_CFG = {
     "noise_target_class": 7,
     "noise_samples":      2000,
     "ft_source_class":    None,
-    "auxk_k":             32,
+    "auxk_k":             16,
     "auxk_k_aux":         64,
-    "auxk_k_pooled":      4,
-    "auxk_k_aux_pooled":  8,
+    "auxk_k_pooled":      1,
+    "auxk_k_aux_pooled":  4,
+    "regionlock_threshold": 0.1,
+    "ewc_lambda":         400.0,
+    "ewc_n_samples":      2048,
+    "replay_capacity":    500,
+    "replay_batch_size":  32,
     "layers": {
         "fc1": {
             "topo_scale":    10.0,
             "factor_h":       4.0,
             "factor_w":       4.0,
-            "lambda_kl":        0.0,
-            "lambda_entropy":   5.0,
+            "lambda_kl":        0.5,
+            "lambda_entropy":   2.0,
+            "lambda_sim":       0.5,
             "temperature":      1.0,
-            "auxk_alpha":       0.03125,
-            "dead_threshold":   100,
+            "auxk_alpha":       0.5,
+            "dead_threshold":   20,
         }
     },
 }

@@ -50,28 +50,52 @@ except ImportError:
 # Constants (must match fmnist_forgetting.py)
 # ---------------------------------------------------------------------------
 
-VARIANT_LABELS  = ["baseline", "topo_only", "topo_sparsity", "topo_auxk_pooled"]
-TOPO_VARIANTS   = ["topo_only", "topo_sparsity", "topo_auxk_pooled"]
+VARIANT_LABELS  = [
+    "baseline",
+    "topo_only", "topo_sparsity", "topo_auxk", "topo_auxk_pooled",
+    "topo_regionlock", "topo_regionlock_pooled",
+    "ewc", "replay", "regionlock_notopo",
+]
+TOPO_VARIANTS   = ["topo_only", "topo_sparsity", "topo_auxk", "topo_auxk_pooled",
+                   "topo_regionlock", "topo_regionlock_pooled"]
 
 DISPLAY_NAMES = {
     "baseline":         "Baseline",
     "topo_only":        "Topo Only",
     "topo_sparsity":    "Topo + Sparsity",
+    "topo_auxk":        "Topo + AuxK",
     "topo_auxk_pooled": "Topo + AuxK (Pooled)",
+    "topo_regionlock":        "Topo + RegionLock",
+    "topo_regionlock_pooled": "Topo + RegionLock (Pooled)",
+    "ewc":              "EWC",
+    "replay":           "Replay Buffer",
+    "regionlock_notopo": "RegionLock (no Topo)",
 }
 
 COLORS = {
     "baseline":         "#757575",
     "topo_only":        "#2196f3",
     "topo_sparsity":    "#4caf50",
+    "topo_auxk":        "#ff5722",
     "topo_auxk_pooled": "#9c27b0",
+    "topo_regionlock":        "#e91e63",
+    "topo_regionlock_pooled": "#3f51b5",
+    "ewc":              "#00bcd4",
+    "replay":           "#ff9800",
+    "regionlock_notopo": "#795548",
 }
 
 MARKERS = {
     "baseline":         "o",
     "topo_only":        "s",
     "topo_sparsity":    "^",
+    "topo_auxk":        "D",
     "topo_auxk_pooled": "v",
+    "topo_regionlock":        "P",
+    "topo_regionlock_pooled": "<",
+    "ewc":              "X",
+    "replay":           "*",
+    "regionlock_notopo": "h",
 }
 
 FMNIST_CLASSES = [
@@ -496,6 +520,18 @@ def plot_entropy_loss(data: dict, out_dir: Path):
     )
 
 
+def plot_sim_loss(data: dict, out_dir: Path):
+    _two_phase_plot(
+        data,
+        pretrain_key="pretrain_sim_per_epoch",
+        ft_key="ft_sim_per_epoch",
+        ylabel="Region Similarity Penalty (mean sq off-diag cosine)",
+        title="Cortical Representational Similarity Penalty — Pretraining and Finetuning (topo_sparsity only)",
+        out_path=out_dir / "11_sim_loss.png",
+        variants=["topo_sparsity"],
+    )
+
+
 def plot_grad_entropy(data: dict, out_dir: Path):
     _two_phase_plot(
         data,
@@ -512,7 +548,7 @@ def plot_auxk_losses(data: dict, out_dir: Path):
 
     Shows topo_auxk and topo_auxk_pooled together for easy comparison.
     """
-    auxk_variants = [v for v in ["topo_auxk_pooled"] if v in data]
+    auxk_variants = [v for v in ["topo_auxk", "topo_auxk_pooled"] if v in data]
     if not auxk_variants:
         print("  [SKIP] auxk_losses — no auxk variants")
         return
@@ -947,6 +983,7 @@ def main():
     plot_topo_loss(data, out_dir)
     plot_kl_loss(data, out_dir)
     plot_entropy_loss(data, out_dir)
+    plot_sim_loss(data, out_dir)
     plot_grad_entropy(data, out_dir)
     plot_auxk_losses(data, out_dir)
 

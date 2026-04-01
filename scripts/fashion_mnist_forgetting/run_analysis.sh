@@ -1,22 +1,24 @@
 #!/bin/bash
 #SBATCH --job-name=fmnist_forgetting_analysis
-#SBATCH --account=gts-aivanova7-lab
-#SBATCH -N1 --ntasks-per-node=1
-#SBATCH --mem=8GB
+#SBATCH --account=overcap
+#SBATCH --partition=overcap
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --mem=8G
 #SBATCH --cpus-per-task=2
-#SBATCH -t 00:15:00
-#SBATCH -q inferno
-#SBATCH --output=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/fmnist_forgetting_analysis-%j.out
-#SBATCH --error=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/fmnist_forgetting_analysis-%j.err
+#SBATCH --time=01:00:00
+#SBATCH --qos=short
+#SBATCH --output=slurm/slurm_outputs/fmnist_forgetting_analysis-%j.out
+#SBATCH --error=slurm/slurm_errors/fmnist_forgetting_analysis-%j.err
 
 set -euo pipefail
 
-EXPERIMENT_DIR="/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments"
+EXPERIMENT_DIR="/nethome/ksingara3/flash/topo-experiments"
 
-source /storage/home/hcoda1/3/ksingara3/scratch/miniconda3/etc/profile.d/conda.sh
+source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate topovlm
 
-mkdir -p "${EXPERIMENT_DIR}/scripts/logs"
+mkdir -p slurm/slurm_outputs slurm/slurm_errors
 mkdir -p "${EXPERIMENT_DIR}/outputs/fashion_mnist_forgetting/figures"
 
 cd "${EXPERIMENT_DIR}"

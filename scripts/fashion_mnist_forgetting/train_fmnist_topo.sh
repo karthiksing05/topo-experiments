@@ -1,22 +1,22 @@
 #!/bin/bash
 #SBATCH --job-name=train_topo_sparsity
-#SBATCH --account=gts-aivanova7-lab
-#SBATCH -N1 --ntasks-per-node=1
-#SBATCH --mem=16GB
+#SBATCH --account=overcap
+#SBATCH --partition=overcap
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
-#SBATCH -t 8:00:00
-#SBATCH -qinferno
-#SBATCH --gres=gpu:1
-#SBATCH --output=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity-%j.out
-#SBATCH --error=/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments/scripts/logs/train_topo_sparsity-%j.err
+#SBATCH --time=8:00:00
+#SBATCH --qos=short
+#SBATCH --gres=gpu:a40:1
+#SBATCH --output=slurm/slurm_outputs/train_topo_sparsity-%j.out
+#SBATCH --error=slurm/slurm_errors/train_topo_sparsity-%j.err
 
 # -- Environment ---------------------------------------------------------------
-module purge
-source /storage/home/hcoda1/3/ksingara3/scratch/miniconda3/etc/profile.d/conda.sh
-conda deactivate
+source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate topovlm
 
-EXPERIMENT_DIR="/storage/home/hcoda1/3/ksingara3/scratch/topo-experiments"
+EXPERIMENT_DIR="/nethome/ksingara3/flash/topo-experiments"
 HF_CACHE_DIR="${EXPERIMENT_DIR}/huggingfacehub_cache"
 
 export HF_HOME="${HF_CACHE_DIR}"
