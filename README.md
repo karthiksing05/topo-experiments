@@ -4,6 +4,8 @@ A number of topography-related things I want to test and mess around with - I'll
 
 The overarching thesis here is that topography necessitates some performance upgrade - if we are building topographic models to have categorical selectivity, we should attempt to leverage that categorical selectivity on a per-instance basis for efficiency gains.
 
+# Topographic PRUNING
+
 # Topographic Sparsity
 
 Applying the batch-kl and per-instance-entropy penalty to every DOWNSAMPLED layer that we apply topoloss to in order to see effects!

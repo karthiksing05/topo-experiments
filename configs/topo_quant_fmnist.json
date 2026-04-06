@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Config for src/topo_quant/fmnist_topo_quant.py",
+    "Trains 4 variants on FashionMNIST (baseline, topo_quant, soft_topo_quant, combined_topo_quant)",
+    "and reports accuracy, parameter count, and model size."
+  ],
+
+  "data_dir":    null,
+  "output_dir":  null,
+  "device":      "cuda:0",
+
+  "hidden_size": 256,
+  "epochs":      20,
+  "batch_size":  128,
+  "lr":          0.0005,
+  "print_freq":  5,
+
+  "num_bits":    4,
+  "tau":         10.0,
+  "tau_spatial": 1.0,
+
+  "soft_initial_temp":        5.0,
+  "soft_final_temp":          0.1,
+  "anneal_schedule":          "cosine",
+
+  "spatial_downsample_factor": 3
+}

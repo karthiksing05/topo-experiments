@@ -518,17 +518,6 @@ topo_quant_loss_fn = GradualTopoQuantLoss(
 )
 ```
 
-## Comparison with Existing Methods
-
-| Method | Type | Training Time | Accuracy @4-bit | Memory |
-|--------|------|---------------|-----------------|--------|
-| Post-Training (GPTQ) | Post-hoc | 0% overhead | Baseline -3% | 4x reduction |
-| QAT (Standard) | Training-time | +20% time | Baseline -2% | 4x reduction |
-| **TopoQuantLoss** | Training-time | +5% time | Baseline -1% | 4x reduction |
-| **SoftTopoQuantLoss** | Training-time | +10% time | **Baseline -0.5%** | 4x reduction |
-
-*Based on ResNet-50 on ImageNet*
-
 ## Biological Motivation
 
 This approach is inspired by constraints in biological neural networks:

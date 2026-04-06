@@ -173,7 +173,7 @@ def plot_pruning_comparison(pruning_results: dict[str, dict], output_dir: Path) 
     if not valid:
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
 
     for i, (label, tp) in enumerate(valid.items()):
         fracs        = tp["pruning_fractions"]
@@ -181,16 +181,21 @@ def plot_pruning_comparison(pruning_results: dict[str, dict], output_dir: Path) 
         pruned_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
         baseline_ppl = tp["unpruned"]["ppl"]
         ppls         = [tp["pruned"][str(f)]["perplexity"] for f in fracs]
+        baseline_vl  = tp["unpruned"]["val_loss"]
+        vls          = [tp["pruned"][str(f)]["val_loss"] for f in fracs]
         x_pct        = [f * 100 for f in fracs]
         color        = COLORS[i % len(COLORS)]
 
         ax1.plot([0] + x_pct, [baseline_tox] + pruned_tox, "o-", label=label, color=color, linewidth=2)
         ax2.plot([0] + x_pct, [baseline_ppl] + ppls,       "s-", label=label, color=color, linewidth=2)
+        ax3.plot([0] + x_pct, [baseline_vl]  + vls,        "^-", label=label, color=color, linewidth=2)
 
     ax2.set_yscale("log")
+    ax3.set_yscale("log")
     for ax, ylabel, title in [
         (ax1, "Toxicity (mean)", "Toxicity Reduction via Neuron Pruning"),
         (ax2, "Perplexity",     "Perplexity Cost of Neuron Pruning"),
+        (ax3, "Val Loss",       "Validation Loss Cost of Neuron Pruning"),
     ]:
         ax.set_xlabel("Neurons Pruned (%)")
         ax.set_ylabel(ylabel)
@@ -242,22 +247,27 @@ def plot_global_pruning_comparison(
     if not valid:
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
     for i, (label, tp) in enumerate(valid.items()):
         fracs        = tp["global_pruning_fractions"]
         baseline_tox = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
         pruned_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
         baseline_ppl = tp["unpruned"]["ppl"]
         ppls         = [tp["pruned"][str(f)]["perplexity"] for f in fracs]
+        baseline_vl  = tp["unpruned"]["val_loss"]
+        vls          = [tp["pruned"][str(f)]["val_loss"] for f in fracs]
         x_pct        = [f * 100 for f in fracs]
         color        = COLORS[i % len(COLORS)]
         ax1.plot([0] + x_pct, [baseline_tox] + pruned_tox, "o-", label=label, color=color, linewidth=2)
         ax2.plot([0] + x_pct, [baseline_ppl] + ppls,       "s-", label=label, color=color, linewidth=2)
+        ax3.plot([0] + x_pct, [baseline_vl]  + vls,        "^-", label=label, color=color, linewidth=2)
 
     ax2.set_yscale("log")
+    ax3.set_yscale("log")
     for ax, ylabel, title in [
         (ax1, "Toxicity (mean)", "Toxicity Reduction via Global Neuron Pruning"),
         (ax2, "Perplexity",     "Perplexity Cost of Global Neuron Pruning"),
+        (ax3, "Val Loss",       "Validation Loss Cost of Global Neuron Pruning"),
     ]:
         ax.set_xlabel("Global Neurons Pruned (%)")
         ax.set_ylabel(ylabel)
@@ -383,17 +393,22 @@ def save_selectivity_visualizations(
                         for f in fracs]
         baseline_ppl = pruning_result["unpruned"]["ppl"]
         ppls         = [pruning_result["pruned"][str(f)]["perplexity"] for f in fracs]
+        baseline_vl  = pruning_result["unpruned"]["val_loss"]
+        vls          = [pruning_result["pruned"][str(f)]["val_loss"] for f in fracs]
         norm_tox     = [v / max(baseline_tox, 1e-8) for v in pruned_tox]
         x_pct        = [f * 100 for f in fracs]
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
         ax1.plot([0] + x_pct, [1.0] + norm_tox,          "o-", color="#d62728", linewidth=2)
         ax2.plot([0] + x_pct, [baseline_ppl] + ppls,      "s-", color="#1f77b4", linewidth=2)
+        ax3.plot([0] + x_pct, [baseline_vl]  + vls,       "^-", color="#2ca02c", linewidth=2)
         ax2.set_yscale("log")
+        ax3.set_yscale("log")
         ax1.axhline(1.0, color="gray", linestyle="--", alpha=0.5)
         for ax, ylabel, title in [
             (ax1, "Toxicity (relative to unpruned)", "Toxicity reduction vs. pruning"),
             (ax2, "Perplexity", "PPL cost of pruning"),
+            (ax3, "Val Loss",   "Val loss cost of pruning"),
         ]:
             ax.set_xlabel("Neurons pruned (%)")
             ax.set_ylabel(ylabel)
@@ -744,6 +759,568 @@ def plot_amplification_comparison(
     print(f"  → {p}")
 
 
+def plot_attenuation_comparison(
+    att_results:     dict[str, dict],
+    pruning_results: dict[str, dict],
+    output_dir:      Path,
+) -> None:
+    """Cross-model toxicity + PPL + val-loss for attenuated neurons,
+    plus a combined pruning-vs-attenuation overlay across all models."""
+    valid_att  = {k: v for k, v in att_results.items()  if v and v.get("att_fracs")}
+    valid_prun = {k: v for k, v in pruning_results.items() if v and v.get("pruning_fractions")}
+    if not valid_att:
+        return
+
+    # ── Cross-model attenuation-only plot ────────────────────────────────────
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+    for i, (label, ta) in enumerate(valid_att.items()):
+        fracs      = ta["att_fracs"]
+        att_factor = ta["att_factor"]
+        bt         = ta["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+        bp         = ta["unpruned"]["ppl"]
+        bv         = ta["unpruned"].get("val_loss", float("nan"))
+        a_tox  = [ta["attenuated"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
+        a_ppls = [ta["attenuated"][str(f)]["perplexity"] for f in fracs]
+        a_vls  = [ta["attenuated"][str(f)].get("val_loss", float("nan")) for f in fracs]
+        color  = COLORS[i % len(COLORS)]
+        x_pct  = [f * 100 for f in fracs]
+        ax1.plot([0] + x_pct, [bt] + a_tox,  "o-", label=f"{label} (×{att_factor})", color=color, linewidth=2)
+        ax2.plot([0] + x_pct, [bp] + a_ppls, "s-", label=f"{label} (×{att_factor})", color=color, linewidth=2)
+        ax3.plot([0] + x_pct, [bv] + a_vls,  "^-", label=f"{label} (×{att_factor})", color=color, linewidth=2)
+    ax2.set_yscale("log")
+    ax3.set_yscale("log")
+    for ax, ylabel, title, xlabel in [
+        (ax1, "Toxicity (mean)", "Toxicity Reduction via Attenuation",  "Neurons Attenuated (%)"),
+        (ax2, "Perplexity",     "Perplexity Cost of Attenuation",       "Neurons Attenuated (%)"),
+        (ax3, "Val Loss",       "Val Loss Cost of Attenuation",         "Neurons Attenuated (%)"),
+    ]:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("Toxic-neuron Attenuation — All Models", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "attenuation_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+    # ── Combined pruning + attenuation overlay ───────────────────────────────
+    all_labels = sorted(set(list(valid_att.keys()) + list(valid_prun.keys())))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    for i, label in enumerate(all_labels):
+        color = COLORS[i % len(COLORS)]
+        if label in valid_prun:
+            tp      = valid_prun[label]
+            p_fracs = tp["pruning_fractions"]
+            bt      = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = tp["unpruned"]["ppl"]
+            p_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in p_fracs]
+            p_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in p_fracs]
+            ax1.plot([0] + [f * 100 for f in p_fracs], [bt] + p_tox,
+                     "o--", color=color, linewidth=2, alpha=0.8, label=f"{label} (prune)")
+            ax2.plot([0] + [f * 100 for f in p_fracs], [bp] + p_ppls,
+                     "s--", color=color, linewidth=2, alpha=0.8, label=f"{label} (prune)")
+        if label in valid_att:
+            ta      = valid_att[label]
+            a_fracs = ta["att_fracs"]
+            af      = ta["att_factor"]
+            bt      = ta["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = ta["unpruned"]["ppl"]
+            a_tox   = [ta["attenuated"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in a_fracs]
+            a_ppls  = [ta["attenuated"][str(f)]["perplexity"] for f in a_fracs]
+            ax1.plot([0] + [f * 100 for f in a_fracs], [bt] + a_tox,
+                     "o-", color=color, linewidth=2, label=f"{label} (att×{af})")
+            ax2.plot([0] + [f * 100 for f in a_fracs], [bp] + a_ppls,
+                     "s-", color=color, linewidth=2, label=f"{label} (att×{af})")
+    ax2.set_yscale("log")
+    for ax, ylabel, title in [
+        (ax1, "Toxicity (mean)", "Pruning vs. Attenuation — Toxicity"),
+        (ax2, "Perplexity",     "Pruning vs. Attenuation — PPL"),
+    ]:
+        ax.set_xlabel("Neurons selected (%)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("Pruning vs. Attenuation of Toxic Neurons", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "prune_vs_attenuate_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+
+def plot_pca_pruning_comparison(
+    pca_results:     dict[str, dict],
+    pruning_results: dict[str, dict],
+    output_dir:      Path,
+) -> None:
+    """Cross-model toxicity + PPL + val-loss for PCA-pruned models,
+    plus a combined neuron-pruning-vs-PCA-pruning overlay."""
+    valid_pca  = {k: v for k, v in pca_results.items()  if v and v.get("pruning_fractions")}
+    valid_prun = {k: v for k, v in pruning_results.items() if v and v.get("pruning_fractions")}
+    if not valid_pca:
+        return
+
+    n_pca = next(iter(valid_pca.values())).get("n_pca_components", "?")
+
+    # ── Cross-model PCA-only plot ────────────────────────────────────────────
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+    for i, (label, tp) in enumerate(valid_pca.items()):
+        fracs = tp["pruning_fractions"]
+        bt    = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+        bp    = tp["unpruned"]["ppl"]
+        bv    = tp["unpruned"].get("val_loss", float("nan"))
+        p_tox  = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
+        p_ppls = [tp["pruned"][str(f)]["perplexity"] for f in fracs]
+        p_vls  = [tp["pruned"][str(f)].get("val_loss", float("nan")) for f in fracs]
+        color  = COLORS[i % len(COLORS)]
+        x_pct  = [f * 100 for f in fracs]
+        ax1.plot([0] + x_pct, [bt] + p_tox,  "o-", label=label, color=color, linewidth=2)
+        ax2.plot([0] + x_pct, [bp] + p_ppls, "s-", label=label, color=color, linewidth=2)
+        ax3.plot([0] + x_pct, [bv] + p_vls,  "^-", label=label, color=color, linewidth=2)
+    ax2.set_yscale("log")
+    ax3.set_yscale("log")
+    for ax, ylabel, title, xlabel in [
+        (ax1, "Toxicity (mean)", f"Toxicity Reduction via PCA Pruning (k={n_pca})",  "PC Fraction Removed (%)"),
+        (ax2, "Perplexity",     f"Perplexity Cost of PCA Pruning (k={n_pca})",       "PC Fraction Removed (%)"),
+        (ax3, "Val Loss",       f"Val Loss Cost of PCA Pruning (k={n_pca})",         "PC Fraction Removed (%)"),
+    ]:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"PCA Pruning — All Models (k={n_pca} components)", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "pca_pruning_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+    # ── Combined neuron pruning + PCA pruning overlay ────────────────────────
+    all_labels = sorted(set(list(valid_pca.keys()) + list(valid_prun.keys())))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    for i, label in enumerate(all_labels):
+        color = COLORS[i % len(COLORS)]
+        if label in valid_prun:
+            tp      = valid_prun[label]
+            p_fracs = tp["pruning_fractions"]
+            bt      = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = tp["unpruned"]["ppl"]
+            p_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in p_fracs]
+            p_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in p_fracs]
+            ax1.plot([0] + [f * 100 for f in p_fracs], [bt] + p_tox,
+                     "o--", color=color, linewidth=2, alpha=0.8, label=f"{label} (neuron)")
+            ax2.plot([0] + [f * 100 for f in p_fracs], [bp] + p_ppls,
+                     "s--", color=color, linewidth=2, alpha=0.8, label=f"{label} (neuron)")
+        if label in valid_pca:
+            tp      = valid_pca[label]
+            a_fracs = tp["pruning_fractions"]
+            bt      = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = tp["unpruned"]["ppl"]
+            a_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in a_fracs]
+            a_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in a_fracs]
+            ax1.plot([0] + [f * 100 for f in a_fracs], [bt] + a_tox,
+                     "o-", color=color, linewidth=2, label=f"{label} (PCA)")
+            ax2.plot([0] + [f * 100 for f in a_fracs], [bp] + a_ppls,
+                     "s-", color=color, linewidth=2, label=f"{label} (PCA)")
+    ax2.set_yscale("log")
+    for ax, ylabel, title in [
+        (ax1, "Toxicity (mean)", "Neuron Pruning vs. PCA Pruning — Toxicity"),
+        (ax2, "Perplexity",     "Neuron Pruning vs. PCA Pruning — PPL"),
+    ]:
+        ax.set_xlabel("Fraction selected (%)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("Neuron Pruning vs. PCA Pruning of Toxic Subspace", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "neuron_vs_pca_pruning_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+
+def save_repeng_visualizations(
+    repeng_result: dict,
+    label:         str,
+    vis_dir:       Path,
+) -> None:
+    """
+    Per-model representation-engineering visualizations saved to *vis_dir*.
+
+    Plots
+    -----
+    1. concept_vectors_heatmap.png   — cortical-sheet of |concept-vector| magnitude
+                                       at each transformer layer
+    2. top_toxic_dimensions.png      — bar chart of the top-32 residual dims with the
+                                       highest mean concept-vector loading across layers
+    3. layer_similarity_matrix.png   — layer×layer cosine-similarity of concept vectors
+    4. repeng_curves.png             — tox + PPL + val-loss vs. steering strength α
+    """
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    raw_cv = repeng_result.get("concept_vectors", {})
+    if not raw_cv:
+        return
+
+    concept_vecs = {int(k): np.array(v) for k, v in raw_cv.items()}
+    n_layers = len(concept_vecs)
+    if n_layers == 0:
+        return
+    n_embd = next(iter(concept_vecs.values())).shape[0]
+    H, W   = _cortical_sheet_dims(n_embd)
+
+    # ── 1. Cortical-sheet heatmap of |concept vector| ────────────────────────
+    ncols_m = 4
+    nrows_m = (n_layers + ncols_m - 1) // ncols_m
+    fig, axes = plt.subplots(nrows_m, ncols_m, figsize=(4 * ncols_m, 4 * nrows_m))
+    axes_flat = list(axes.flat) if hasattr(axes, "flat") else [axes]
+    for idx, (li, cv) in enumerate(sorted(concept_vecs.items())):
+        ax  = axes_flat[idx]
+        img = np.abs(cv).reshape(H, W)
+        vmax = float(np.percentile(img, 97)) or 1.0
+        ax.imshow(img, cmap="magma", vmin=0, vmax=vmax, aspect="auto",
+                  interpolation="nearest")
+        ax.set_title(f"L{li}  |v|", fontsize=9)
+        ax.axis("off")
+    for j in range(n_layers, len(axes_flat)):
+        axes_flat[j].axis("off")
+    fig.suptitle(
+        f"{label} — Toxicity concept-vector magnitude per residual dim\n"
+        f"(brighter = dimension contributes more to the toxic direction)",
+        fontsize=11,
+    )
+    plt.tight_layout()
+    p = vis_dir / "concept_vectors_heatmap.png"
+    fig.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"      → {p}")
+
+    # ── 2. Top-k toxic residual dimensions ───────────────────────────────────
+    stacked  = np.stack([concept_vecs[i] for i in sorted(concept_vecs)], axis=0)
+    mean_abs = np.abs(stacked).mean(axis=0)
+    top_k    = min(32, n_embd)
+    top_idx  = np.argsort(mean_abs)[-top_k:][::-1]
+    top_vals = mean_abs[top_idx]
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.bar(range(top_k), top_vals, color="#9467bd")
+    ax.set_xticks(range(top_k))
+    ax.set_xticklabels([str(d) for d in top_idx], rotation=45, ha="right", fontsize=8)
+    ax.set_xlabel("Residual stream dimension index")
+    ax.set_ylabel("Mean |concept loading| across layers")
+    ax.set_title(f"{label} — Top-{top_k} residual dims in toxicity concept direction")
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    p = vis_dir / "top_toxic_dimensions.png"
+    fig.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"      → {p}")
+
+    # ── 3. Layer-to-layer concept-vector similarity ───────────────────────────
+    layer_ids = sorted(concept_vecs.keys())
+    n_l = len(layer_ids)
+    sim = np.zeros((n_l, n_l))
+    for a in range(n_l):
+        for b in range(n_l):
+            sim[a, b] = float(np.dot(concept_vecs[layer_ids[a]],
+                                     concept_vecs[layer_ids[b]]))
+    fig, ax = plt.subplots(figsize=(max(6, n_l * 0.65), max(5, n_l * 0.6)))
+    im = ax.imshow(sim, vmin=-1, vmax=1, cmap="RdBu_r", aspect="equal")
+    plt.colorbar(im, ax=ax, shrink=0.8, label="Cosine similarity")
+    ticks = list(range(n_l))
+    labs  = [f"L{i}" for i in layer_ids]
+    ax.set_xticks(ticks); ax.set_xticklabels(labs, fontsize=8)
+    ax.set_yticks(ticks); ax.set_yticklabels(labs, fontsize=8)
+    ax.set_title(f"{label} — Cosine similarity of concept vectors across layers")
+    plt.tight_layout()
+    p = vis_dir / "layer_similarity_matrix.png"
+    fig.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"      → {p}")
+
+    # ── 4. Steering curves (tox + PPL + val-loss vs. α) ──────────────────────
+    alphas  = repeng_result.get("alphas", [])
+    steered = repeng_result.get("steered", {})
+    if not alphas or not steered:
+        return
+    bt = repeng_result["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+    bp = repeng_result["unpruned"]["ppl"]
+    bv = repeng_result["unpruned"].get("val_loss", float("nan"))
+    s_tox  = [steered[str(a)]["toxicity_scores"]["toxicity"]["mean"] for a in alphas]
+    s_ppls = [steered[str(a)]["perplexity"] for a in alphas]
+    s_vls  = [steered[str(a)].get("val_loss", float("nan")) for a in alphas]
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+    ax1.plot([0] + list(alphas), [bt] + s_tox,  "o-", color="#9467bd", linewidth=2)
+    ax2.plot([0] + list(alphas), [bp] + s_ppls, "s-", color="#1f77b4", linewidth=2)
+    ax3.plot([0] + list(alphas), [bv] + s_vls,  "^-", color="#2ca02c", linewidth=2)
+    ax2.set_yscale("log")
+    ax3.set_yscale("log")
+    for ax, ylabel, title in [
+        (ax1, "Mean toxicity", "Toxicity vs. steering strength α"),
+        (ax2, "Perplexity",    "Perplexity vs. steering strength α"),
+        (ax3, "Val Loss",      "Val Loss vs. steering strength α"),
+    ]:
+        ax.set_xlabel("Steering coefficient α")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"{label} — Representation Engineering Steering Sweep", fontsize=13)
+    plt.tight_layout()
+    p = vis_dir / "repeng_curves.png"
+    fig.savefig(p, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"      → {p}")
+
+
+def plot_repeng_comparison(
+    repeng_results:  dict[str, dict],
+    pruning_results: dict[str, dict],
+    output_dir:      Path,
+) -> None:
+    """
+    Cross-model comparison plots for representation-engineering steering.
+
+    Saves
+    -----
+    repeng_comparison.png            — 3-panel: tox + PPL + val-loss vs. α for all models
+    prune_vs_repeng_comparison.png   — 2-panel: tox-PPL tradeoff frontier (pruning dashed,
+                                        rep-eng solid) and normalised tox/PPL-ratio tradeoff
+    """
+    valid_rep  = {k: v for k, v in repeng_results.items()  if v and v.get("alphas")}
+    valid_prun = {k: v for k, v in pruning_results.items() if v and v.get("pruning_fractions")}
+    if not valid_rep:
+        return
+
+    # ── Cross-model rep-eng-only plot ─────────────────────────────────────────
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+    for i, (label, tr) in enumerate(valid_rep.items()):
+        alphas = tr["alphas"]
+        bt     = tr["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+        bp     = tr["unpruned"]["ppl"]
+        bv     = tr["unpruned"].get("val_loss", float("nan"))
+        s_tox  = [tr["steered"][str(a)]["toxicity_scores"]["toxicity"]["mean"] for a in alphas]
+        s_ppls = [tr["steered"][str(a)]["perplexity"] for a in alphas]
+        s_vls  = [tr["steered"][str(a)].get("val_loss", float("nan")) for a in alphas]
+        color  = COLORS[i % len(COLORS)]
+        ax1.plot([0] + list(alphas), [bt] + s_tox,  "o-", label=label, color=color, linewidth=2)
+        ax2.plot([0] + list(alphas), [bp] + s_ppls, "s-", label=label, color=color, linewidth=2)
+        ax3.plot([0] + list(alphas), [bv] + s_vls,  "^-", label=label, color=color, linewidth=2)
+    ax2.set_yscale("log")
+    ax3.set_yscale("log")
+    for ax, ylabel, title, xlabel in [
+        (ax1, "Toxicity (mean)", "Toxicity Reduction via Rep-Eng Steering",  "Steering coefficient α"),
+        (ax2, "Perplexity",     "Perplexity Cost of Rep-Eng Steering",       "Steering coefficient α"),
+        (ax3, "Val Loss",       "Val Loss Cost of Rep-Eng Steering",         "Steering coefficient α"),
+    ]:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle("Representation Engineering Steering — All Models", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "repeng_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+    if not valid_prun:
+        return
+
+    # ── Toxicity-PPL tradeoff: pruning vs. rep-eng ───────────────────────────
+    all_labels = sorted(set(list(valid_rep.keys()) + list(valid_prun.keys())))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    for i, label in enumerate(all_labels):
+        color = COLORS[i % len(COLORS)]
+        if label in valid_prun:
+            tp      = valid_prun[label]
+            p_fracs = tp["pruning_fractions"]
+            bt_p    = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp_p    = tp["unpruned"]["ppl"]
+            p_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in p_fracs]
+            p_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in p_fracs]
+            p_pr    = [tp["pruned"][str(f)]["ppl_ratio"] for f in p_fracs]
+            ax1.plot([bt_p] + p_tox, [bp_p] + p_ppls,
+                     "o--", color=color, linewidth=2, alpha=0.8, label=f"{label} (prune)")
+            ax2.plot([1.0] + [t / max(bt_p, 1e-8) for t in p_tox], [1.0] + p_pr,
+                     "o--", color=color, linewidth=2, alpha=0.8, label=f"{label} (prune)")
+        if label in valid_rep:
+            tr      = valid_rep[label]
+            alphas  = tr["alphas"]
+            bt_r    = tr["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp_r    = tr["unpruned"]["ppl"]
+            s_tox   = [tr["steered"][str(a)]["toxicity_scores"]["toxicity"]["mean"] for a in alphas]
+            s_ppls  = [tr["steered"][str(a)]["perplexity"] for a in alphas]
+            s_pr    = [tr["steered"][str(a)]["ppl_ratio"] for a in alphas]
+            ax1.plot([bt_r] + s_tox, [bp_r] + s_ppls,
+                     "o-", color=color, linewidth=2, label=f"{label} (repeng)")
+            ax2.plot([1.0] + [t / max(bt_r, 1e-8) for t in s_tox], [1.0] + s_pr,
+                     "o-", color=color, linewidth=2, label=f"{label} (repeng)")
+
+    ax1.set_xlabel("Mean toxicity")
+    ax1.set_ylabel("Perplexity")
+    ax1.set_yscale("log")
+    ax1.set_title("Toxicity vs. PPL tradeoff: Pruning vs. Rep-Eng")
+    ax1.legend(fontsize=7)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_xlabel("Toxicity ratio (steered / baseline)")
+    ax2.set_ylabel("PPL ratio (steered / baseline)")
+    ax2.set_title("Tox reduction vs. PPL cost: Pruning vs. Rep-Eng")
+    ax2.legend(fontsize=7)
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(1.0, color="gray", linestyle="--", alpha=0.5)
+    ax2.axvline(1.0, color="gray", linestyle="--", alpha=0.5)
+
+    fig.suptitle("Pruning vs. Representation Engineering: Toxicity–PPL Tradeoff", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / "prune_vs_repeng_comparison.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+
+# ── DAA / OSD shared helper ───────────────────────────────────────────────────────────────────
+
+def _plot_generic_pruning_comparison(
+    method_results:   dict[str, dict],
+    pruning_results:  dict[str, dict],
+    output_dir:       Path,
+    method_key:       str,
+    method_label:     str,
+    x_label:          str,
+    out_stem:         str,
+    out_overlay_stem: str,
+) -> None:
+    valid_meth = {k: v for k, v in method_results.items()  if v and v.get("pruning_fractions")}
+    valid_prun = {k: v for k, v in pruning_results.items() if v and v.get("pruning_fractions")}
+    if not valid_meth:
+        return
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+    for i, (label, tp) in enumerate(valid_meth.items()):
+        fracs  = tp["pruning_fractions"]
+        bt     = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+        bp     = tp["unpruned"]["ppl"]
+        bv     = tp["unpruned"].get("val_loss", float("nan"))
+        p_tox  = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
+        p_ppls = [tp["pruned"][str(f)]["perplexity"] for f in fracs]
+        p_vls  = [tp["pruned"][str(f)].get("val_loss", float("nan")) for f in fracs]
+        color  = COLORS[i % len(COLORS)]
+        x_pct  = [f * 100 for f in fracs]
+        ax1.plot([0] + x_pct, [bt] + p_tox,  "o-", label=label, color=color, linewidth=2)
+        ax2.plot([0] + x_pct, [bp] + p_ppls, "s-", label=label, color=color, linewidth=2)
+        ax3.plot([0] + x_pct, [bv] + p_vls,  "^-", label=label, color=color, linewidth=2)
+    ax2.set_yscale("log")
+    ax3.set_yscale("log")
+    for ax, ylabel, title in [
+        (ax1, "Toxicity (mean)", f"Toxicity Reduction via {method_label}"),
+        (ax2, "Perplexity",     f"Perplexity Cost of {method_label}"),
+        (ax3, "Val Loss",       f"Val Loss Cost of {method_label}"),
+    ]:
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"{method_label} — All Models", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / f"{out_stem}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+    all_labels = sorted(set(list(valid_meth.keys()) + list(valid_prun.keys())))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    for i, label in enumerate(all_labels):
+        color = COLORS[i % len(COLORS)]
+        if label in valid_prun:
+            tp      = valid_prun[label]
+            p_fracs = tp["pruning_fractions"]
+            bt      = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = tp["unpruned"]["ppl"]
+            p_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in p_fracs]
+            p_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in p_fracs]
+            ax1.plot([0] + [f * 100 for f in p_fracs], [bt] + p_tox,
+                     "o--", color=color, linewidth=2, alpha=0.8, label=f"{label} (neuron)")
+            ax2.plot([0] + [f * 100 for f in p_fracs], [bp] + p_ppls,
+                     "s--", color=color, linewidth=2, alpha=0.8, label=f"{label} (neuron)")
+        if label in valid_meth:
+            tp      = valid_meth[label]
+            a_fracs = tp["pruning_fractions"]
+            bt      = tp["unpruned"]["toxicity_scores"]["toxicity"]["mean"]
+            bp      = tp["unpruned"]["ppl"]
+            a_tox   = [tp["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in a_fracs]
+            a_ppls  = [tp["pruned"][str(f)]["perplexity"] for f in a_fracs]
+            ax1.plot([0] + [f * 100 for f in a_fracs], [bt] + a_tox,
+                     "o-", color=color, linewidth=2, label=f"{label} ({method_key})")
+            ax2.plot([0] + [f * 100 for f in a_fracs], [bp] + a_ppls,
+                     "s-", color=color, linewidth=2, label=f"{label} ({method_key})")
+    ax2.set_yscale("log")
+    for ax, ylabel, title in [
+        (ax1, "Toxicity (mean)", f"Neuron Pruning vs. {method_label} — Toxicity"),
+        (ax2, "Perplexity",     f"Neuron Pruning vs. {method_label} — PPL"),
+    ]:
+        ax.set_xlabel("Fraction (%)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"Neuron Pruning vs. {method_label}", fontsize=13)
+    plt.tight_layout()
+    p = output_dir / f"{out_overlay_stem}.png"
+    fig.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  → {p}")
+
+
+def plot_daa_comparison(
+    daa_results:     dict[str, dict],
+    pruning_results: dict[str, dict],
+    output_dir:      Path,
+) -> None:
+    """Cross-model comparison for DAA pruning.
+
+    Saves ``daa_comparison.png`` and ``neuron_vs_daa_comparison.png``.
+    """
+    _plot_generic_pruning_comparison(
+        method_results=daa_results,
+        pruning_results=pruning_results,
+        output_dir=output_dir,
+        method_key="DAA",
+        method_label="DAA Pruning (Differential Activation)",
+        x_label="Projection strength α (%)",
+        out_stem="daa_comparison",
+        out_overlay_stem="neuron_vs_daa_comparison",
+    )
+
+
+def plot_osd_comparison(
+    osd_results:     dict[str, dict],
+    pruning_results: dict[str, dict],
+    output_dir:      Path,
+) -> None:
+    """Cross-model comparison for OSD pruning.
+
+    Saves ``osd_comparison.png`` and ``neuron_vs_osd_comparison.png``.
+    """
+    _plot_generic_pruning_comparison(
+        method_results=osd_results,
+        pruning_results=pruning_results,
+        output_dir=output_dir,
+        method_key="OSD",
+        method_label="OSD Pruning (Orthogonal Subspace)",
+        x_label="PC Fraction Removed (%)",
+        out_stem="osd_comparison",
+        out_overlay_stem="neuron_vs_osd_comparison",
+    )
+
+
 def save_svd_visualizations(
     svd_sel:  dict,   # layer_idx (str) \u2192 {singular_values, component_scores, ...}
     svd_prun: dict,   # {pruning_fractions, unpruned, pruned}
@@ -1054,9 +1631,11 @@ def save_global_selectivity_visualizations(
     pruned_tox   = [pruning_result["pruned"][str(f)]["toxicity_scores"]["toxicity"]["mean"] for f in fracs]
     baseline_ppl = pruning_result["unpruned"]["ppl"]
     ppls         = [pruning_result["pruned"][str(f)]["perplexity"] for f in fracs]
+    baseline_vl  = pruning_result["unpruned"]["val_loss"]
+    vls          = [pruning_result["pruned"][str(f)]["val_loss"] for f in fracs]
     x_pct        = [f * 100 for f in fracs]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
     ax1.plot([0] + x_pct, [baseline_tox] + pruned_tox, "o-", color="#d62728", linewidth=2)
     ax1.set_xlabel("Neurons pruned globally (%)")
     ax1.set_ylabel("Toxicity (mean)")
@@ -1069,6 +1648,13 @@ def save_global_selectivity_visualizations(
     ax2.set_ylabel("Perplexity")
     ax2.set_title("PPL cost of global pruning")
     ax2.grid(True, alpha=0.3)
+
+    ax3.plot([0] + x_pct, [baseline_vl] + vls, "^-", color="#2ca02c", linewidth=2)
+    ax3.set_yscale("log")
+    ax3.set_xlabel("Neurons pruned globally (%)")
+    ax3.set_ylabel("Val Loss")
+    ax3.set_title("Val loss cost of global pruning")
+    ax3.grid(True, alpha=0.3)
 
     fig.suptitle(f"{label} — Global toxicity pruning sweep", fontsize=13)
     plt.tight_layout()
@@ -1312,6 +1898,91 @@ def discover_global_pruning_jsons(
     return global_results
 
 
+def discover_attenuation_jsons(
+    output_dir:   Path,
+    tau_to_label: dict[str, str],
+) -> dict[str, dict]:
+    """Discover attenuation_tau*.json files. Returns dict keyed by model label."""
+    att_results: dict[str, dict] = {}
+    for p in sorted(output_dir.glob("attenuation_tau*.json")):
+        stem    = p.stem.removeprefix("attenuation_tau")
+        tau_str = stem.replace("_", ".")
+        label   = tau_to_label.get(tau_str, f"tau={tau_str}")
+        data    = _load_json(p)
+        if data:
+            att_results[label] = data
+            print(f"  Loaded attenuation for {label} ← {p.name}")
+    return att_results
+
+
+def discover_pca_pruning_jsons(
+    output_dir:   Path,
+    tau_to_label: dict[str, str],
+) -> dict[str, dict]:
+    """Discover pca_pruning_tau*.json files. Returns dict keyed by model label."""
+    pca_results: dict[str, dict] = {}
+    for p in sorted(output_dir.glob("pca_pruning_tau*.json")):
+        stem    = p.stem.removeprefix("pca_pruning_tau")
+        tau_str = stem.replace("_", ".")
+        label   = tau_to_label.get(tau_str, f"tau={tau_str}")
+        data    = _load_json(p)
+        if data:
+            pca_results[label] = data
+            print(f"  Loaded PCA pruning for {label} ← {p.name}")
+    return pca_results
+
+
+def discover_daa_pruning_jsons(
+    output_dir:   Path,
+    tau_to_label: dict[str, str],
+) -> dict[str, dict]:
+    """Discover daa_pruning_tau*.json files. Returns dict keyed by model label."""
+    daa_results: dict[str, dict] = {}
+    for p in sorted(output_dir.glob("daa_pruning_tau*.json")):
+        stem    = p.stem.removeprefix("daa_pruning_tau")
+        tau_str = stem.replace("_", ".")
+        label   = tau_to_label.get(tau_str, f"tau={tau_str}")
+        data    = _load_json(p)
+        if data:
+            daa_results[label] = data
+            print(f"  Loaded DAA pruning for {label} \u2190 {p.name}")
+    return daa_results
+
+
+def discover_osd_pruning_jsons(
+    output_dir:   Path,
+    tau_to_label: dict[str, str],
+) -> dict[str, dict]:
+    """Discover osd_pruning_tau*.json files. Returns dict keyed by model label."""
+    osd_results: dict[str, dict] = {}
+    for p in sorted(output_dir.glob("osd_pruning_tau*.json")):
+        stem    = p.stem.removeprefix("osd_pruning_tau")
+        tau_str = stem.replace("_", ".")
+        label   = tau_to_label.get(tau_str, f"tau={tau_str}")
+        data    = _load_json(p)
+        if data:
+            osd_results[label] = data
+            print(f"  Loaded OSD pruning for {label} \u2190 {p.name}")
+    return osd_results
+
+
+def discover_repeng_jsons(
+    output_dir:   Path,
+    tau_to_label: dict[str, str],
+) -> dict[str, dict]:
+    """Discover repeng_tau*.json files. Returns dict keyed by model label."""
+    repeng_results: dict[str, dict] = {}
+    for p in sorted(output_dir.glob("repeng_tau*.json")):
+        stem    = p.stem.removeprefix("repeng_tau")
+        tau_str = stem.replace("_", ".")
+        label   = tau_to_label.get(tau_str, f"tau={tau_str}")
+        data    = _load_json(p)
+        if data:
+            repeng_results[label] = data
+            print(f"  Loaded rep-eng for {label} ← {p.name}")
+    return repeng_results
+
+
 # ── results.json synthesis from secondary JSON files ────────────────────────────
 
 def synthesize_results_json(output_dir: Path) -> dict | None:
@@ -1417,6 +2088,26 @@ def parse_args():
         help="Skip toxic-neuron amplification plots",
     )
     parser.add_argument(
+        "--no_attenuation", action="store_true",
+        help="Skip toxic-neuron attenuation plots",
+    )
+    parser.add_argument(
+        "--no_pca_pruning", action="store_true",
+        help="Skip PCA pruning plots",
+    )
+    parser.add_argument(
+        "--no_daa_pruning", action="store_true",
+        help="Skip DAA pruning plots",
+    )
+    parser.add_argument(
+        "--no_osd_pruning", action="store_true",
+        help="Skip OSD pruning plots",
+    )
+    parser.add_argument(
+        "--no_repeng", action="store_true",
+        help="Skip representation-engineering steering plots",
+    )
+    parser.add_argument(
         "--no_global_pruning", action="store_true",
         help="Skip cross-layer global neuron pruning plots",
     )
@@ -1463,6 +2154,11 @@ def main():
     svd_selectivity_all:    dict[str, dict] = {}
     svd_pruning_results:    dict[str, dict] = {}
     amp_results:            dict[str, dict] = {}
+    att_results:            dict[str, dict] = {}
+    pca_pruning_results:    dict[str, dict] = {}
+    daa_pruning_results:    dict[str, dict] = {}
+    osd_pruning_results:    dict[str, dict] = {}
+    repeng_results:         dict[str, dict] = {}
     global_pruning_results: dict[str, dict] = {}
     if not args.no_svd:
         print("Discovering SVD JSON files…")
@@ -1473,6 +2169,26 @@ def main():
         print("Discovering amplification JSON files…")
         amp_results = discover_amplification_jsons(output_dir, tau_to_label)
         print(f"  Found {len(amp_results)} amplification file(s).")
+    if not args.no_attenuation:
+        print("Discovering attenuation JSON files…")
+        att_results = discover_attenuation_jsons(output_dir, tau_to_label)
+        print(f"  Found {len(att_results)} attenuation file(s).")
+    if not args.no_pca_pruning:
+        print("Discovering PCA pruning JSON files…")
+        pca_pruning_results = discover_pca_pruning_jsons(output_dir, tau_to_label)
+        print(f"  Found {len(pca_pruning_results)} PCA pruning file(s).")
+    if not args.no_daa_pruning:
+        print("Discovering DAA pruning JSON files…")
+        daa_pruning_results = discover_daa_pruning_jsons(output_dir, tau_to_label)
+        print(f"  Found {len(daa_pruning_results)} DAA pruning file(s).")
+    if not args.no_osd_pruning:
+        print("Discovering OSD pruning JSON files…")
+        osd_pruning_results = discover_osd_pruning_jsons(output_dir, tau_to_label)
+        print(f"  Found {len(osd_pruning_results)} OSD pruning file(s).")
+    if not args.no_repeng:
+        print("Discovering rep-eng JSON files…")
+        repeng_results = discover_repeng_jsons(output_dir, tau_to_label)
+        print(f"  Found {len(repeng_results)} rep-eng file(s).")
     if not args.no_global_pruning:
         print("Discovering global pruning JSON files…")
         global_pruning_results = discover_global_pruning_jsons(output_dir, tau_to_label)
@@ -1491,6 +2207,26 @@ def main():
     if not args.no_amplification and amp_results:
         print("Plotting amplification comparison…")
         plot_amplification_comparison(amp_results, pruning_results, output_dir)
+    # ── Attenuation comparison ────────────────────────────────────────────
+    if not args.no_attenuation and att_results:
+        print("Plotting attenuation comparison…")
+        plot_attenuation_comparison(att_results, pruning_results, output_dir)
+    # ── PCA pruning comparison ────────────────────────────────────────────
+    if not args.no_pca_pruning and pca_pruning_results:
+        print("Plotting PCA pruning comparison…")
+        plot_pca_pruning_comparison(pca_pruning_results, pruning_results, output_dir)
+    # ── DAA pruning comparison ─────────────────────────────────────────────
+    if not args.no_daa_pruning and daa_pruning_results:
+        print("Plotting DAA pruning comparison…")
+        plot_daa_comparison(daa_pruning_results, pruning_results, output_dir)
+    # ── OSD pruning comparison ─────────────────────────────────────────────
+    if not args.no_osd_pruning and osd_pruning_results:
+        print("Plotting OSD pruning comparison…")
+        plot_osd_comparison(osd_pruning_results, pruning_results, output_dir)
+    # ── Rep-eng comparison ────────────────────────────────────────────────
+    if not args.no_repeng and repeng_results:
+        print("Plotting rep-eng comparison…")
+        plot_repeng_comparison(repeng_results, pruning_results, output_dir)
     # ── Effective rank + SVD plots ─────────────────────────────────────
     if not args.no_svd:
         if svd_selectivity_all:
@@ -1580,6 +2316,21 @@ def main():
             save_global_selectivity_visualizations(
                 t_stats_per_layer=t_stats_np,
                 pruning_result=gp,
+                label=label,
+                vis_dir=vis_dir,
+            )
+
+    # ── Per-model rep-eng visualizations ────────────────────────────────────
+    if not args.no_repeng and not args.no_selectivity and repeng_results:
+        sel_dir = output_dir / "selectivity"
+        print()
+        print(f"Plotting per-model rep-eng visualizations → {sel_dir}")
+        for label, tr in repeng_results.items():
+            safe_label = label.replace(" ", "_").replace("=", "")
+            vis_dir    = sel_dir / safe_label
+            print(f"  {label}  →  {vis_dir.relative_to(output_dir)}/")
+            save_repeng_visualizations(
+                repeng_result=tr,
                 label=label,
                 vis_dir=vis_dir,
             )

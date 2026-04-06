@@ -17,6 +17,7 @@
 #   sbatch --export=ALL,NO_SELECTIVITY=1 scripts/misc/replot_toxicity_nanogpt.sh
 # ────────────────────────────────────────────────────────────────────────────
 #SBATCH --job-name=replot_tox
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --output=slurm/slurm_outputs/replot_toxicity-%j.out
 #SBATCH --error=slurm/slurm_errors/replot_toxicity-%j.err
 #SBATCH --partition=overcap
@@ -72,7 +73,7 @@ replot_one() {
     echo "Replotting: $dir"
     echo "Selectivity: $([[ "$NO_SELECTIVITY" == "1" ]] && echo disabled || echo enabled)"
     echo "========================================"
-    python src/test/replot_toxicity_nanogpt.py "${args[@]}"
+    python src/toxicity/replot_toxicity_nanogpt.py "${args[@]}"
     echo "Done → $dir"
     echo
 }

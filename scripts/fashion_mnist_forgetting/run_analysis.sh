@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fmnist_forgetting_analysis
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --account=overcap
 #SBATCH --partition=overcap
 #SBATCH --nodes=1

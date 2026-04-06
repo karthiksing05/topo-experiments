@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=split_fmnist
+#SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --account=tail-lab
 #SBATCH --partition=tail-lab
 #SBATCH --nodes=1
