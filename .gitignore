@@ -11,3 +11,4 @@ slurm/
 wandb_token
 .hf_cache
 .torch_cache
+hf_token

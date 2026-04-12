@@ -15,7 +15,7 @@ Notes so far:
 *   Entropy penalty does most of the work - small KL penalty to encourage the whole cortical sheet being explored
 
 Note that there are other ways to induce sparsity!
-*   Removing 
+*   Removing things structured?? Sparsity as a result of pruning
 
 Why Topographic Sparsity? Most likely to induce better downstream performance for finetuning performance!! At the very least, catastrophic forgetting!!
 *   By inducing sparsity in regions, we're inducing sparsity in gradients, which will result in sparse representation and robustness of representations!

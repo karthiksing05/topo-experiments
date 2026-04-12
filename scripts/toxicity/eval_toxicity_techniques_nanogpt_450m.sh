@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=eval_tox_techniques
+#SBATCH --job-name=eval_tox_tech_450m
 #SBATCH --exclude=spot,heistotron,clippy,hal,asimo,kipp,smith,t1000,bb8,jarvis,gideon,ripl-s1,ash,c3po,calculon,eva,johnny5,neo,tars,vicki,ava,jill,walle
 #SBATCH --account=overcap
 #SBATCH --partition=overcap
@@ -10,22 +10,25 @@
 #SBATCH --time=12:00:00
 #SBATCH --qos=short
 #SBATCH --gres=gpu:1
-#SBATCH --output=slurm/slurm_outputs/eval_tox_techniques-%j.out
-#SBATCH --error=slurm/slurm_errors/eval_tox_techniques-%j.err
+#SBATCH --output=slurm/slurm_outputs/eval_tox_tech_450m-%j.out
+#SBATCH --error=slurm/slurm_errors/eval_tox_tech_450m-%j.err
 
-# Focused technique comparison for topo-nanoGPT detoxification:
+# Technique comparison for topo-nanoGPT 450M detoxification:
 #   per-layer pruning, global pruning,
 #   per-layer DAA, global DAA,
-#   per-layer OSD, global OSD
-# at fractions [20%, 50%] on:
+#   per-layer OSD, global OSD,
+#   topo-region pruning, topo smoothed DAA, topo spectral cluster,
+#   activation steering, topo lowrank SVD, topo freq detox, lowrank toxic projection
+# on:
 #   RealToxicityPrompts  (allenai/real-toxicity-prompts)
 #   ToxiGen              (microsoft/toxigen)
-# scored by Detoxify (always) and optionally Perspective API.
+# scored by Detoxify (always) and optionally LlamaGuard.
 #
 # Configurable knobs (override via: sbatch --export=ALL,VAR=value ...):
 #
-#   TAUS                  comma-separated tau values  (default "0.0,0.5,1.0,3.0,50.0")
-#   FRACS                 comma-separated intervention fractions  (default "0.2,0.5")
+#   TAUS                  comma-separated tau values  (default "0,30722,307226")
+#   STEP                  checkpoint step to load     (default 5960)
+#   FRACS                 comma-separated intervention fractions  (default "0.0,0.05,...,0.5")
 #   N_PROMPTS             toxic prompts per dataset  (default 200)
 #   N_TOXIGEN_PROMPTS     ToxiGen prompts; falls back to N_PROMPTS if unset
 #   N_GEN                 completions per prompt  (default 1)
@@ -45,22 +48,22 @@
 #   NO_TOXIGEN            set to 1 to skip ToxiGen evaluation
 #   NO_RTP                set to 1 to skip RealToxicityPrompts evaluation
 #   LLAMAGUARD_MODEL      HF model path/id for LlamaGuard (optional)
-#   RESUME                set to 1 to skip taus whose JSON already exists
+#   RESUME                set to 1 to skip methods whose results already exist
 #   OUTPUT_DIR            output directory
 #
 # Examples
 # --------
-# Quick sanity check (no pruning, RTP only, 50 prompts, tau=0.0 only):
-#   sbatch --export=ALL,N_PROMPTS=50,TAUS="0.0",NO_PRUNING=1,NO_TOXIGEN=1 \
-#          scripts/toxicity/eval_toxicity_techniques_nanogpt.sh
+# Quick sanity check (tau=0 only, RTP only, 50 prompts):
+#   sbatch --export=ALL,N_PROMPTS=50,TAUS="0",NO_PRUNING=1,NO_TOXIGEN=1 \
+#          scripts/toxicity/eval_toxicity_techniques_nanogpt_450m.sh
 #
 # Only pruning + OSD (skip DAA, topo, steering, lowrank, llamaguard):
 #   sbatch --export=ALL,NO_DAA=1,NO_TOPO=1,NO_STEERING=1,NO_LOWRANK=1,NO_LLAMAGUARD=1,RESUME=1 \
-#          scripts/toxicity/eval_toxicity_techniques_nanogpt.sh
+#          scripts/toxicity/eval_toxicity_techniques_nanogpt_450m.sh
 #
 # Resume interrupted run:
 #   sbatch --export=ALL,RESUME=1 \
-#          scripts/toxicity/eval_toxicity_techniques_nanogpt.sh
+#          scripts/toxicity/eval_toxicity_techniques_nanogpt_450m.sh
 
 set -euo pipefail
 
@@ -89,7 +92,8 @@ else
 fi
 
 # -- Configurable knobs --------------------------------------------------------
-TAUS="${TAUS:-0.0,0.5,1.0,3.0,50.0}"
+TAUS="${TAUS:-0,30722,307226}"
+STEP="${STEP:-5960}"
 FRACS="${FRACS:-0.0,0.05,0.1,0.15,0.2}"
 N_PROMPTS="${N_PROMPTS:-300}"
 N_TOXIGEN_PROMPTS="${N_TOXIGEN_PROMPTS:-$N_PROMPTS}"
@@ -111,17 +115,18 @@ NO_TOXIGEN="${NO_TOXIGEN:-0}"
 NO_RTP="${NO_RTP:-0}"
 LLAMAGUARD_MODEL="${LLAMAGUARD_MODEL:-}"
 RESUME="${RESUME:-0}"
-OUTPUT_DIR="${OUTPUT_DIR:-${EXPERIMENT_DIR}/outputs/toxicity_techniques_nanogpt}"
+OUTPUT_DIR="${OUTPUT_DIR:-${EXPERIMENT_DIR}/outputs/toxicity_techniques_nanogpt_450m}"
 
 # -- Job info ------------------------------------------------------------------
 echo "=============================================="
-echo "Topo NanoGPT -- Technique Comparison Eval"
+echo "Topo NanoGPT 450M -- Technique Comparison Eval"
 echo "=============================================="
 echo "Job ID              : ${SLURM_JOB_ID:-local}"
 echo "Node                : ${SLURM_NODELIST:-$(hostname)}"
 echo "GPUs                : ${CUDA_VISIBLE_DEVICES:-N/A}"
 echo "HF cache            : $HF_CACHE_DIR"
 echo "taus                : $TAUS"
+echo "step                : $STEP"
 echo "fracs               : $FRACS"
 echo "n_prompts (RTP)     : $N_PROMPTS"
 echo "n_prompts (ToxiGen) : $N_TOXIGEN_PROMPTS"
@@ -158,8 +163,9 @@ if [[ -n "$LLAMAGUARD_MODEL" ]]; then
     LLAMAGUARD_ARGS+=(--llamaguard_model "$LLAMAGUARD_MODEL")
 fi
 
-srun python -u src/toxicity/eval_toxicity_techniques_nanogpt.py \
+srun python -u src/toxicity/eval_toxicity_techniques_nanogpt_450m.py \
     --taus                   "$TAUS"                  \
+    --step                   "$STEP"                  \
     --fracs                  "$FRACS"                 \
     --n_prompts              "$N_PROMPTS"             \
     --n_gen                  "$N_GEN"                 \

@@ -66,18 +66,18 @@ import tiktoken
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
 
 # ── Paths / constants ─────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).resolve().parents[2]
-OUTPUT_DIR  = BASE_DIR / "outputs" / "toxicity_techniques_nanogpt"
-HF_CACHE    = BASE_DIR / ".hf_cache"
+OUTPUT_DIR  = BASE_DIR / "outputs" / "toxicity_techniques_nanogpt_450m"
+HF_CACHE    = BASE_DIR / ".hf_cache"  # still used for dataset caching
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 HF_CACHE.mkdir(parents=True, exist_ok=True)
 
-HF_REPO      = "murtylab/topo-nanogpt-fineweb10B"
-ALL_TAUS     = [0.0, 0.5, 1.0, 3.0, 50.0]
-BASELINE_TAU = 0.0
+CKPT_ROOT    = Path("/nethome/ksingara3/flash/topo_nano_bigger")
+ALL_TAUS     = [0, 30722, 307226]
+BASELINE_TAU = 0
+FINAL_STEP   = 5960
 EVAL_FRACS   = [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 
 
@@ -122,92 +122,176 @@ METHOD_LABELS = [
 
 _LLAMAGUARD_MODEL_ID = "meta-llama/Llama-Guard-3-8B"
 
-# ── Minimal nanoGPT ───────────────────────────────────────────────────────────
+# ── Minimal nanoGPT-450M (inference-only) ─────────────────────────────────────
+# Matches the architecture in github.com/KellerJordan/modded-nanogpt as used to
+# train the gpt2-450m checkpoints.  Key differences from the 125M eval:
+#   • RMSNorm (not LayerNorm)
+#   • Rotary embeddings (not learned positional)
+#   • ReluSquared activation (not GELU)
+#   • Block 7 has no attention (MLP only)
+#   • U-net skip connections + value embeddings
+#   • Logit soft-capping following Gemma 2
+#   • Merged QKV linear in attention
+
+
+def _rms_norm(x: torch.Tensor) -> torch.Tensor:
+    return F.rms_norm(x, (x.size(-1),))
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        # half-truncated RoPE following modded-nanogpt
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim // 4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim // 4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.register_buffer("cos", theta.cos(), persistent=False)
+        self.register_buffer("sin", theta.sin(), persistent=False)
+
+    def forward(self, x_BTHD: torch.Tensor) -> torch.Tensor:
+        cos = self.cos[None, :x_BTHD.size(-3), None, :]
+        sin = self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim: int = 128):
         super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head  = n_head
-        self.n_embd  = n_embd
-        self.c_attn  = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.c_proj  = nn.Linear(n_embd, n_embd, bias=False)
-        self.attn_dropout  = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size),
-            persistent=False,
-        )
+        self.num_heads = num_heads
+        self.head_dim  = head_dim
+        hdim = num_heads * head_dim
+        self.qkv    = nn.Linear(dim, 3 * hdim, bias=False)
+        self.rotary = Rotary(head_dim, max_seq_len)
+        self.c_proj = nn.Linear(hdim, dim, bias=False)
+        self.attn_scale = 0.12
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                ve: torch.Tensor | None = None,
+                sa_lambdas: torch.Tensor | None = None) -> torch.Tensor:
         B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        hd = C // self.n_head
-        q = q.view(B, T, self.n_head, hd).transpose(1, 2)
-        k = k.view(B, T, self.n_head, hd).transpose(1, 2)
-        v = v.view(B, T, self.n_head, hd).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hd))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.c_proj(y))
+        q, k, v = (
+            self.qkv(x)
+            .view(B, T, 3 * self.num_heads, self.head_dim)
+            .chunk(3, dim=-2)
+        )
+        q, k = _rms_norm(q), _rms_norm(k)
+        q, k = self.rotary(q), self.rotary(k)
+        if sa_lambdas is not None:
+            if ve is not None:
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
+            else:
+                v = sa_lambdas[0] * v
+        y = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            is_causal=True, scale=self.attn_scale,
+        ).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        return self.c_proj(y)
 
 
 class MLP(nn.Module):
-    def __init__(self, n_embd: int, dropout: float = 0.0):
+    def __init__(self, dim: int, mlp_expand_factor: int = 4):
         super().__init__()
-        self.c_fc    = nn.Linear(n_embd, 4 * n_embd, bias=False)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * n_embd, n_embd, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        hdim = int(mlp_expand_factor * dim)
+        self.c_fc   = nn.Linear(dim, hdim, bias=False)
+        self.c_proj = nn.Linear(hdim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        x = self.c_fc(x)
+        x = F.relu(x).square()  # ReluSquared
+        x = self.c_proj(x)
+        return x
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int,
+                 layer_idx: int, head_dim: int = 128, mlp_expand_factor: int = 4):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embd, elementwise_affine=True, bias=False)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
-        self.ln_2 = nn.LayerNorm(n_embd, elementwise_affine=True, bias=False)
-        self.mlp  = MLP(n_embd, dropout)
+        # Block 7 (the 8th layer) skips attention, following modded-nanogpt
+        self.attn = (
+            CausalSelfAttention(dim, num_heads, max_seq_len, head_dim)
+            if layer_idx != 7 else None
+        )
+        self.mlp = MLP(dim, mlp_expand_factor)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x: torch.Tensor,
+                ve: torch.Tensor | None = None,
+                x0: torch.Tensor | None = None,
+                lambdas: torch.Tensor | None = None,
+                sa_lambdas: torch.Tensor | None = None) -> torch.Tensor:
+        if lambdas is not None and x0 is not None:
+            x = lambdas[0] * x + lambdas[1] * x0
+        if self.attn is not None:
+            x = x + self.attn(_rms_norm(x), ve, sa_lambdas)
+        x = x + self.mlp(_rms_norm(x))
         return x
 
 
 class GPT(nn.Module):
     def __init__(
         self,
-        vocab_size: int = 50304,
-        n_layer: int = 12,
-        n_head:  int = 12,
-        n_embd:  int = 768,
-        block_size: int = 1024,
-        dropout: float = 0.0,
+        vocab_size:        int = 50304,
+        num_layers:        int = 16,
+        num_heads:         int = 8,
+        model_dim:         int = 1024,
+        max_seq_len:       int = 2048,
+        head_dim:          int = 128,
+        mlp_expand_factor: int = 4,
     ):
         super().__init__()
-        self.block_size = block_size
-        self.transformer = nn.ModuleDict(dict(
-            wte  = nn.Embedding(vocab_size, n_embd),
-            wpe  = nn.Embedding(block_size, n_embd),
-            h    = nn.ModuleList([Block(n_embd, n_head, block_size, dropout) for _ in range(n_layer)]),
-            ln_f = nn.LayerNorm(n_embd, elementwise_affine=True, bias=False),
-        ))
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        self.block_size = max_seq_len
+        self.num_layers = num_layers
+        self.model_dim  = model_dim
+
+        self.embed = nn.Embedding(vocab_size, model_dim)
+        self.value_embeds = nn.ModuleList([
+            nn.Embedding(vocab_size, model_dim) for _ in range(3)
+        ])
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, max_seq_len, i, head_dim, mlp_expand_factor)
+            for i in range(num_layers)
+        ])
+        self.lm_head = nn.Linear(model_dim, vocab_size, bias=False)
+
+        # Scalar parameters: [skip_weights(n) | block_lambdas(2n) | SA_lambdas(2n)]
+        self.scalars = nn.Parameter(torch.zeros(5 * num_layers))
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         B, T = idx.size()
-        pos = torch.arange(T, device=idx.device)
-        x = self.transformer.wte(idx) + self.transformer.wpe(pos)
-        for block in self.transformer.h:
-            x = block(x)
-        return self.lm_head(self.transformer.ln_f(x))
+
+        ve_raw = [v_emb(idx) for v_emb in self.value_embeds]
+        # 0-1-2 … 0-1-2 pattern on value embeddings
+        ve = (
+            [ve_raw[0], ve_raw[1], ve_raw[2]]
+            + [None] * (self.num_layers - 6)
+            + [ve_raw[0], ve_raw[1], ve_raw[2]]
+        )
+
+        x = x0 = _rms_norm(self.embed(idx))
+
+        n    = self.num_layers
+        half = n // 2
+        skip_weights = self.scalars[:half]
+        lambdas      = self.scalars[n : 3 * n].view(-1, 2)
+        sa_lambdas   = self.scalars[3 * n : 5 * n].view(-1, 2)
+
+        skip_connections: list[torch.Tensor] = []
+        for i in range(n):
+            if i >= half:
+                x = x + skip_weights[i - half] * skip_connections.pop()
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i])
+            if i < half:
+                skip_connections.append(x)
+
+        x = _rms_norm(x)
+        logits = self.lm_head(x).float()
+        # Soft-cap logits following Gemma 2 / modded-nanogpt
+        logits = 30.0 * torch.sigmoid(logits / (7.5 * self.model_dim ** 0.5))
+        return logits
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int = 200,
@@ -225,15 +309,22 @@ class GPT(nn.Module):
         return idx
 
 
-def load_gpt_checkpoint(path: str, device: torch.device) -> GPT:
-    ckpt    = torch.load(path, map_location=device, weights_only=False)
-    args    = ckpt["model_args"]
-    cleaned = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()}
-    model   = GPT(
-        vocab_size=args["vocab_size"], n_layer=args["n_layer"],
-        n_head=args["n_head"],         n_embd=args["n_embd"],
-        block_size=args["block_size"], dropout=args.get("dropout", 0.0),
+def load_gpt_checkpoint(config_path: str, ckpt_path: str,
+                        device: torch.device, max_seq_len: int = 2048) -> GPT:
+    """Load a 450M nanoGPT checkpoint from local {config_json, step_*.pt}."""
+    import json as _json
+    with open(config_path) as f:
+        cfg = _json.load(f)
+    model = GPT(
+        vocab_size=50304,
+        num_layers=cfg["num_layers"],
+        num_heads=cfg["num_heads"],
+        model_dim=cfg["model_dim"],
+        max_seq_len=max_seq_len,
+        mlp_expand_factor=cfg.get("mlp_expand_factor", 4),
     )
+    ckpt    = torch.load(ckpt_path, map_location=device, weights_only=False)
+    cleaned = {k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()}
     model.load_state_dict(cleaned, strict=True)
     return model.to(device).eval()
 
@@ -594,7 +685,7 @@ def collect_mlp_activations(
     max_tokens: int = 64,
 ) -> dict[int, np.ndarray]:
     """Return dict[layer_idx → (total_tokens, 4*n_embd)] pre-GELU activations."""
-    n_layers = len(model.transformer.h)
+    n_layers = len(model.blocks)
     buffers: dict[int, list[np.ndarray]] = defaultdict(list)
     hooks = []
 
@@ -603,7 +694,7 @@ def collect_mlp_activations(
             buffers[li].append(out.squeeze(0).cpu().float().numpy())
         return hook_fn
 
-    for i, block in enumerate(model.transformer.h):
+    for i, block in enumerate(model.blocks):
         hooks.append(block.mlp.c_fc.register_forward_hook(_make_hook(i)))
 
     model.eval()
@@ -628,8 +719,8 @@ def collect_mlp_activations(
 # ── Restore helper ────────────────────────────────────────────────────────────
 
 def _snapshot_c_proj(model: GPT) -> dict[int, torch.Tensor]:
-    return {i: model.transformer.h[i].mlp.c_proj.weight.data.clone()
-            for i in range(len(model.transformer.h))}
+    return {i: model.blocks[i].mlp.c_proj.weight.data.clone()
+            for i in range(len(model.blocks))}
 
 
 def _remove_steering_hooks(model: GPT) -> None:
@@ -643,7 +734,7 @@ def _restore_c_proj(model: GPT, snap: dict[int, torch.Tensor]) -> None:
     _remove_steering_hooks(model)
     with torch.no_grad():
         for i, w in snap.items():
-            model.transformer.h[i].mlp.c_proj.weight.copy_(w)
+            model.blocks[i].mlp.c_proj.weight.copy_(w)
 
 
 # ── Neuron t-statistics (selectivity) ────────────────────────────────────────
@@ -673,11 +764,11 @@ def _apply_per_layer_neuron_pruning(
     """Zero out the top-frac% neurons (highest t-stat) per layer in c_proj.weight."""
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             k = max(1, round(frac * len(t)))
             top_idx = np.argsort(t)[-k:]
-            W = model.transformer.h[li].mlp.c_proj.weight  # (n_embd, 4*n_embd)
+            W = model.blocks[li].mlp.c_proj.weight  # (n_embd, 4*n_embd)
             W.copy_(snap[li])
             W[:, top_idx] = 0.0
 
@@ -695,12 +786,12 @@ def _apply_global_neuron_pruning(
     threshold = np.percentile(all_t, 100 * (1 - frac))
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             top_idx = np.where(t >= threshold)[0]
             if top_idx.size == 0:
                 continue
-            W = model.transformer.h[li].mlp.c_proj.weight
+            W = model.blocks[li].mlp.c_proj.weight
             W.copy_(snap[li])
             W[:, top_idx] = 0.0
 
@@ -735,9 +826,9 @@ def _apply_per_layer_daa(
     """Apply W = W - frac * W @ d @ d^T per layer (frac=1 → full removal)."""
     with torch.no_grad():
         for li, d in daa_dirs.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
-            W    = model.transformer.h[li].mlp.c_proj.weight
+            W    = model.blocks[li].mlp.c_proj.weight
             d_t  = torch.tensor(d, dtype=W.dtype, device=W.device).unsqueeze(1)  # (4d,1)
             W.copy_(snap[li] - frac * (snap[li] @ d_t @ d_t.T))
 
@@ -763,13 +854,13 @@ def _apply_global_daa(
     with torch.no_grad():
         # First restore all
         for li, w in snap.items():
-            model.transformer.h[li].mlp.c_proj.weight.copy_(w)
+            model.blocks[li].mlp.c_proj.weight.copy_(w)
         # Apply full removal only to top layers
         for li in top_layers:
-            if li not in daa_dirs or li >= len(model.transformer.h):
+            if li not in daa_dirs or li >= len(model.blocks):
                 continue
             d   = daa_dirs[li]
-            W   = model.transformer.h[li].mlp.c_proj.weight
+            W   = model.blocks[li].mlp.c_proj.weight
             d_t = torch.tensor(d, dtype=W.dtype, device=W.device).unsqueeze(1)
             W.sub_(W @ d_t @ d_t.T)
 
@@ -836,11 +927,11 @@ def _apply_per_layer_osd(
     """Remove top-frac OSD components per layer: W = W - W @ U @ U^T."""
     with torch.no_grad():
         for li, U in osd_bases.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             k = max(1, round(frac * U.shape[1]))
             Uk  = torch.tensor(U[:, :k], dtype=snap[li].dtype, device=snap[li].device)
-            W   = model.transformer.h[li].mlp.c_proj.weight
+            W   = model.blocks[li].mlp.c_proj.weight
             W.copy_(snap[li] - snap[li] @ Uk @ Uk.T)
 
 
@@ -876,14 +967,14 @@ def _apply_global_osd(
 
     with torch.no_grad():
         for li, w in snap.items():
-            model.transformer.h[li].mlp.c_proj.weight.copy_(w)
+            model.blocks[li].mlp.c_proj.weight.copy_(w)
         for li, pc_indices in by_layer.items():
-            if li not in osd_bases or li >= len(model.transformer.h):
+            if li not in osd_bases or li >= len(model.blocks):
                 continue
             U    = osd_bases[li]
             cols = sorted(set(pc_indices))
             Uk   = torch.tensor(U[:, cols], dtype=snap[li].dtype, device=snap[li].device)
-            W    = model.transformer.h[li].mlp.c_proj.weight
+            W    = model.blocks[li].mlp.c_proj.weight
             W.sub_(W @ Uk @ Uk.T)
 
 
@@ -923,7 +1014,7 @@ def _apply_topo_region_pruning(
     from scipy.ndimage import gaussian_filter
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             n_neurons = len(t)
             H, W = _find_cortical_sheet_size(n_neurons)
@@ -957,7 +1048,7 @@ def _apply_topo_region_pruning(
                 mask_flat[active[excess]] = False
 
             prune_idx = np.where(mask_flat)[0]
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             W_mat.copy_(snap[li])
             W_mat[:, prune_idx] = 0.0
 
@@ -983,7 +1074,7 @@ def _apply_topo_smoothed_daa(
     from scipy.ndimage import gaussian_filter
     with torch.no_grad():
         for li in sorted(toxic_acts.keys()):
-            if li not in nontoxic_acts or li >= len(model.transformer.h):
+            if li not in nontoxic_acts or li >= len(model.blocks):
                 continue
             # Compute raw difference vector
             d = toxic_acts[li].mean(0) - nontoxic_acts[li].mean(0)
@@ -1000,7 +1091,7 @@ def _apply_topo_smoothed_daa(
                 continue
             d_unit = (d_smooth / mag).astype(np.float32)
 
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             d_t = torch.tensor(d_unit, dtype=W_mat.dtype, device=W_mat.device).unsqueeze(1)
             W_mat.copy_(snap[li] - frac * (snap[li] @ d_t @ d_t.T))
 
@@ -1029,7 +1120,7 @@ def _apply_topo_spectral_cluster_prune(
 ) -> None:
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             n_neurons = len(t)
             H, W = _find_cortical_sheet_size(n_neurons)
@@ -1083,7 +1174,7 @@ def _apply_topo_spectral_cluster_prune(
             top_in_cluster = np.argsort(cluster_t)[-n_from_cluster:]
             prune_idx = toxic_idx[top_in_cluster]
 
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             W_mat.copy_(snap[li])
             W_mat[:, prune_idx] = 0.0
 
@@ -1111,7 +1202,7 @@ def _collect_residual_means(
     max_tokens: int = 64,
 ) -> dict[int, np.ndarray]:
     """Return dict[layer_idx -> (n_texts, n_embd)] mean-over-tokens residual activations."""
-    n_layers = len(model.transformer.h)
+    n_layers = len(model.blocks)
     buffers: dict[int, list[np.ndarray]] = defaultdict(list)
     hooks = []
 
@@ -1121,7 +1212,7 @@ def _collect_residual_means(
             buffers[li].append(out.squeeze(0).mean(0).cpu().float().numpy())
         return hook_fn
 
-    for i, block in enumerate(model.transformer.h):
+    for i, block in enumerate(model.blocks):
         hooks.append(block.register_forward_hook(_make_hook(i)))
 
     model.eval()
@@ -1169,9 +1260,9 @@ def _apply_activation_steering(
     _remove_steering_hooks(model)
     hooks = []
     for li, d in steering_dirs.items():
-        if li >= len(model.transformer.h):
+        if li >= len(model.blocks):
             continue
-        block = model.transformer.h[li]
+        block = model.blocks[li]
         d_t = torch.tensor(d, dtype=torch.float32, device=next(block.parameters()).device)
 
         def _make_hook(direction, alpha):
@@ -1206,7 +1297,7 @@ def _apply_topo_lowrank_svd(
 ) -> None:
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             W = snap[li]  # (n_embd, 4*n_embd)
             # Full SVD on CPU for numerical stability
@@ -1221,7 +1312,7 @@ def _apply_topo_lowrank_svd(
             s_new = s.copy()
             s_new[remove_idx] = 0.0
             W_new = (U * s_new[None, :]) @ Vt
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             W_mat.copy_(torch.tensor(W_new, dtype=W.dtype, device=W.device))
 
 
@@ -1250,7 +1341,7 @@ def _apply_topo_freq_detox(
     from scipy.fft import dctn, idctn
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             n_neurons = len(t)
             H, W_grid = _find_cortical_sheet_size(n_neurons)
@@ -1278,7 +1369,7 @@ def _apply_topo_freq_detox(
             # The detoxified weight = original minus what was removed
             W_removed = W_np - W_detox.reshape(n_embd, n_neurons)
             W_new = W_np - frac * W_removed
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             W_mat.copy_(torch.tensor(W_new.reshape(n_embd, n_neurons),
                                      dtype=W_snap.dtype, device=W_snap.device))
 
@@ -1310,7 +1401,7 @@ def _apply_lowrank_toxic_projection(
 ) -> None:
     with torch.no_grad():
         for li, t in t_stats.items():
-            if li >= len(model.transformer.h):
+            if li >= len(model.blocks):
                 continue
             W_snap = snap[li]  # (n_embd, 4*n_embd)
             W_np = W_snap.cpu().float().numpy()
@@ -1331,7 +1422,7 @@ def _apply_lowrank_toxic_projection(
             # Low-rank toxic component
             T_lowrank = (U * s[None, :]) @ Vt
             W_new = W_np - frac * T_lowrank
-            W_mat = model.transformer.h[li].mlp.c_proj.weight
+            W_mat = model.blocks[li].mlp.c_proj.weight
             W_mat.copy_(torch.tensor(W_new, dtype=W_snap.dtype, device=W_snap.device))
 
 
@@ -2334,6 +2425,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--taus",      type=str, default=",".join(str(t) for t in ALL_TAUS),
                    help="Comma-separated tau values to evaluate")
+    p.add_argument("--step",      type=int, default=FINAL_STEP,
+                   help="Checkpoint step number to load")
     p.add_argument("--n_prompts", type=int, default=200,
                    help="Number of toxic prompts per dataset")
     p.add_argument("--n_gen",     type=int, default=1,
@@ -2379,7 +2472,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args   = parse_args()
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    taus   = [float(t) for t in args.taus.split(",")]
+    taus   = [int(t) for t in args.taus.split(",")]
     fracs  = [float(f) for f in args.fracs.split(",")]
     top_k  = args.top_k if args.top_k > 0 else None
 
@@ -2473,12 +2566,12 @@ def main() -> None:
             else:
                 print(f"  [resume] {out_json.name} partially complete — continuing.")
 
-        # Download + load checkpoint
-        filename  = f"tau_{tau}.pt"
-        ckpt_path = hf_hub_download(repo_id=HF_REPO, filename=filename,
-                                    cache_dir=str(HF_CACHE))
-        print(f"  Loading model…")
-        model = load_gpt_checkpoint(ckpt_path, device)
+        # Load checkpoint from local directory
+        run_name    = f"gpt2-450m-tau-{tau}-downsample-9.0-all-topo"
+        config_path = str(CKPT_ROOT / f"{run_name}.json")
+        ckpt_path   = str(CKPT_ROOT / run_name / f"step_{args.step:06d}.pt")
+        print(f"  Loading model from {ckpt_path}…")
+        model = load_gpt_checkpoint(config_path, ckpt_path, device)
         print(f"  Params: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
         for ds_key, ds_prompts in [

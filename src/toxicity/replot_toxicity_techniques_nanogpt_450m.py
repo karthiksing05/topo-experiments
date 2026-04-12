@@ -2,24 +2,19 @@
 """
 replot_toxicity_techniques_nanogpt.py
 ──────────────────────────────────────
-Re-reads the JSON output files from eval_toxicity_techniques_nanogpt.py and
-regenerates all plots.
+Re-reads the JSON output files from eval_toxicity_techniques_nanogpt_450m.py and
+regenerates all plots for the 450M model.
 
 Accepts individual paths or a directory containing `techniques_tau*.json` files.
 
 Usage
 -----
   # Re-plot everything in the default output directory
-  python src/toxicity/replot_toxicity_techniques_nanogpt.py
+  python src/toxicity/replot_toxicity_techniques_nanogpt_450m.py
 
   # Re-plot from a specific directory
-  python src/toxicity/replot_toxicity_techniques_nanogpt.py \\
-      --input_dir outputs/toxicity_techniques_nanogpt
-
-  # Re-plot specific JSON files
-  python src/toxicity/replot_toxicity_techniques_nanogpt.py \\
-      --files outputs/toxicity_techniques_nanogpt/techniques_tau0_0.json \\
-               outputs/toxicity_techniques_nanogpt/techniques_tau1_0.json
+  python src/toxicity/replot_toxicity_techniques_nanogpt_450m.py \\
+      --input_dir outputs/toxicity_techniques_nanogpt_450m
 
   # Save to a different directory
   python ... --output_dir custom_plots/
@@ -41,7 +36,7 @@ import numpy as np
 # ── Import plotting helpers from eval script ─────────────────────────────────
 # Resolve path relative to this file
 _HERE = Path(__file__).resolve().parent
-_EVAL = _HERE / "eval_toxicity_techniques_nanogpt.py"
+_EVAL = _HERE / "eval_toxicity_techniques_nanogpt_450m.py"
 
 if not _EVAL.exists():
     print(f"ERROR: cannot find eval script at {_EVAL}")
