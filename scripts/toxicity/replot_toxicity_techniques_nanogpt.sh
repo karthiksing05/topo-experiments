@@ -36,9 +36,18 @@ source ~/flash/miniconda3/etc/profile.d/conda.sh
 conda activate topovlm
 
 # ── Configurable knobs ────────────────────────────────────────────────────────
+# NOTE: FRACS contains commas, which conflict with sbatch --export=ALL,VAR=val
+# syntax.  Use FRAC_MAX instead (e.g. sbatch --export=ALL,FRAC_MAX=0.2 ...)
+# to auto-generate 0.0,0.05,...,FRAC_MAX.  Or set FRACS in your shell first:
+#   export FRACS="0.0,0.05,0.1,0.15,0.2" && sbatch --export=ALL ...
 INPUT_DIR="${INPUT_DIR:-${EXPERIMENT_DIR}/outputs/toxicity_techniques_nanogpt}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
-FRACS="${FRACS:-0.0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5}"
+FRAC_MAX="${FRAC_MAX:-}"
+if [[ -n "$FRAC_MAX" ]]; then
+    FRACS=$(python3 -c "mx=float('$FRAC_MAX'); print(','.join(str(round(x/100,2)) for x in range(0, int(round(mx*100))+1, 5)))")
+else
+    FRACS="${FRACS:-0.0,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5}"
+fi
 NO_BAR="${NO_BAR:-0}"
 NO_LINE="${NO_LINE:-0}"
 NO_PER_MODEL="${NO_PER_MODEL:-0}"

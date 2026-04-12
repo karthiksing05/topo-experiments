@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=12:00:00
 #SBATCH --qos=short
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a40:1
 #SBATCH --output=slurm/slurm_outputs/eval_tox_techniques-%j.out
 #SBATCH --error=slurm/slurm_errors/eval_tox_techniques-%j.err
 
