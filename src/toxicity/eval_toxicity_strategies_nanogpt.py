@@ -313,8 +313,9 @@ def _apply_chars_steering(
     frac: float,
     snap: dict[int, torch.Tensor],
 ) -> None:
-    """Apply cluster-aware weight editing: subtract the per-cluster steering
-    direction from c_proj columns corresponding to that cluster."""
+    """Apply cluster-aware weight editing: for each cluster's steering
+    direction in MLP-hidden space, project it out of c_proj so that the
+    toxic direction no longer maps into the residual stream."""
     with torch.no_grad():
         for li, w in snap.items():
             model.transformer.h[li].mlp.c_proj.weight.copy_(w)
@@ -324,28 +325,19 @@ def _apply_chars_steering(
                 continue
             W = model.transformer.h[li].mlp.c_proj.weight  # (n_embd, D)
             n_clusters = centroids.shape[0]
+            n_total = max(len(labels), 1)
 
             for cl in range(n_clusters):
-                mask = (labels == cl)
-                neuron_indices = np.where(mask)[0]
-                if len(neuron_indices) == 0:
+                cluster_weight = float((labels == cl).sum()) / n_total
+                if cluster_weight < 1e-6:
                     continue
-
-                # steering direction for this cluster
+                # steering direction in MLP-hidden space (D,)
                 s = torch.tensor(steering[cl], dtype=W.dtype,
-                                 device=W.device)  # (D,)
-                # Project out the steering direction from c_proj columns of
-                # neurons in this cluster, scaled by frac
-                for j in neuron_indices:
-                    col = W[:, int(j)]          # (n_embd,)
-                    # We need this in output (residual) space.
-                    # The column of c_proj maps neuron j → residual.
-                    # Suppress the component along W_proj @ s_dir.
-                    # Since s is in MLP-hidden space, project through c_proj:
-                    proj_dir = W @ s             # (n_embd,)
-                    proj_dir = proj_dir / (proj_dir.norm() + 1e-8)
-                    component = (col @ proj_dir) * proj_dir
-                    W[:, int(j)] -= frac * component
+                                 device=W.device)
+                # Image of s through c_proj → residual space
+                Ws = W @ s  # (n_embd,)
+                # Rank-1 update: remove the component that maps s → Ws
+                W.sub_(frac * cluster_weight * Ws.unsqueeze(1) * s.unsqueeze(0))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -568,8 +560,13 @@ def run_strategy_sweep(
     skip_vocab_shifting: bool = False,
     skip_pct: bool = False,
     existing: dict | None = None,
+    save_fn=None,
 ) -> dict:
-    """Run all new strategies at every frac, similar to run_technique_sweep."""
+    """Run all new strategies at every frac, similar to run_technique_sweep.
+
+    *save_fn* is an optional ``(results_dict) -> None`` callback invoked after
+    each method completes so that progress is persisted incrementally.
+    """
 
     max_toks = max(1, n_selectivity_tokens // max(1, len(prompts)))
     base_ppl = baseline_result["perplexity"]
@@ -587,11 +584,18 @@ def run_strategy_sweep(
             if not math.isnan(res["val_loss"]) else float("nan")
         return {**res, "ppl_ratio": ppl_ratio, "val_loss_ratio": vl_ratio}
 
+    def _save_incremental():
+        if save_fn is not None:
+            save_fn(results)
+
     results: dict = existing if existing else {}
     if "fracs" not in results:
         results["fracs"] = fracs
     if "baseline" not in results:
         results["baseline"] = baseline_result
+
+    # Save baseline immediately
+    _save_incremental()
 
     # ── Collect activations (shared across methods) ───────────────────────
     need_acts = (not skip_eigenshift) or (not skip_chars) or (not skip_pct)
@@ -606,23 +610,15 @@ def run_strategy_sweep(
     snap = _snapshot_c_proj(model)
     lm_head_snap = model.lm_head.weight.data.clone()
 
-    # ── Requested methods list for resume ─────────────────────────────────
-    requested = []
-    if not skip_eigenshift:
-        requested.append("eigenshift")
-    if not skip_self_debiasing:
-        requested.append("self_debiasing")
-    if not skip_chars:
-        requested.append("chars_lite")
-    if not skip_vocab_shifting:
-        requested.append("vocab_shifting")
-    if not skip_pct:
-        requested.append("pct_osd")
+    cuda_ok = True  # set to False if a CUDA-context error is encountered
 
     # ── 1. EigenShift ─────────────────────────────────────────────────────
     if not skip_eigenshift:
         if "eigenshift" in results and results["eigenshift"]:
             print(f"  ── eigenshift (already done, skipping) ──")
+        elif not cuda_ok:
+            print(f"  ── eigenshift (skipped – GPU context corrupted) ──")
+            results["eigenshift"] = {}
         else:
             print(f"  ── eigenshift ──")
             U, S, Vt, tox_scores = _eigenshift_score_eigenvectors(
@@ -631,47 +627,78 @@ def run_strategy_sweep(
             es_results: dict[str, dict] = {}
             for frac in fracs:
                 print(f"    frac={frac}…", end=" ", flush=True)
-                _apply_eigenshift(model, U, S, Vt, tox_scores, frac, device)
+                _restore_ok = True
                 try:
+                    _apply_eigenshift(model, U, S, Vt, tox_scores, frac, device)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
                     es_results[str(frac)] = _eval_and_record()
                     tox = es_results[str(frac)]["detoxify"]["toxicity"]["mean"]
                     ppl_r = es_results[str(frac)]["ppl_ratio"]
                     print(f"tox={tox:.4f}  ppl_ratio={ppl_r:.3f}")
+                except RuntimeError as _exc:
+                    if "CUDA" in str(_exc).upper() or "CUBLAS" in str(_exc).upper():
+                        print(f"CUDA error at frac={frac}: {_exc!r}")
+                        cuda_ok = _restore_ok = False
+                    else:
+                        raise
                 finally:
-                    _restore_lm_head(model, lm_head_snap)
+                    if _restore_ok:
+                        _restore_lm_head(model, lm_head_snap)
+                if not cuda_ok:
+                    break
             results["eigenshift"] = es_results
+            _save_incremental()
+            print(f"    [saved incrementally]")
 
     # ── 2. Self-Debiasing ─────────────────────────────────────────────────
     if not skip_self_debiasing:
         if "self_debiasing" in results and results["self_debiasing"]:
             print(f"  ── self_debiasing (already done, skipping) ──")
+        elif not cuda_ok:
+            print(f"  ── self_debiasing (skipped – GPU context corrupted) ──")
+            results["self_debiasing"] = {}
         else:
             print(f"  ── self_debiasing ──")
             sd_results: dict[str, dict] = {}
             for frac in fracs:
-                alpha = frac * 2.0  # map [0,0.5] → [0,1.0] for debiasing strength
+                alpha = frac * 2.0
                 print(f"    frac={frac} (α={alpha:.2f})…", end=" ", flush=True)
-                res = evaluate_self_debiased(
-                    model, tokenizer, prompts, detox_model, device,
-                    owt_ref_text, alpha=alpha,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature, top_k=top_k,
-                    llamaguard_scorer=llamaguard_scorer,
-                )
-                ppl_ratio = res["perplexity"] / max(base_ppl, 1e-6)
-                vl_ratio = res["val_loss"] / max(base_vl, 1e-6) \
-                    if not math.isnan(res["val_loss"]) else float("nan")
-                sd_results[str(frac)] = {
-                    **res, "ppl_ratio": ppl_ratio, "val_loss_ratio": vl_ratio,
-                    "alpha": alpha}
-                tox = res["detoxify"]["toxicity"]["mean"]
-                print(f"tox={tox:.4f}  ppl_ratio={ppl_ratio:.3f}")
+                try:
+                    res = evaluate_self_debiased(
+                        model, tokenizer, prompts, detox_model, device,
+                        owt_ref_text, alpha=alpha,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature, top_k=top_k,
+                        llamaguard_scorer=llamaguard_scorer,
+                    )
+                    ppl_ratio = res["perplexity"] / max(base_ppl, 1e-6)
+                    vl_ratio = res["val_loss"] / max(base_vl, 1e-6) \
+                        if not math.isnan(res["val_loss"]) else float("nan")
+                    sd_results[str(frac)] = {
+                        **res, "ppl_ratio": ppl_ratio, "val_loss_ratio": vl_ratio,
+                        "alpha": alpha}
+                    tox = res["detoxify"]["toxicity"]["mean"]
+                    print(f"tox={tox:.4f}  ppl_ratio={ppl_ratio:.3f}")
+                except RuntimeError as _exc:
+                    if "CUDA" in str(_exc).upper() or "CUBLAS" in str(_exc).upper():
+                        print(f"CUDA error at frac={frac}: {_exc!r}")
+                        cuda_ok = False
+                    else:
+                        raise
+                if not cuda_ok:
+                    break
             results["self_debiasing"] = sd_results
+            _save_incremental()
+            print(f"    [saved incrementally]")
 
     # ── 3. CHaRS-lite ─────────────────────────────────────────────────────
     if not skip_chars:
         if "chars_lite" in results and results["chars_lite"]:
             print(f"  ── chars_lite (already done, skipping) ──")
+        elif not cuda_ok:
+            print(f"  ── chars_lite (skipped – GPU context corrupted) ──")
+            results["chars_lite"] = {}
         else:
             print(f"  ── chars_lite ──")
             chars_data = _compute_chars_directions(
@@ -680,20 +707,37 @@ def run_strategy_sweep(
             ch_results: dict[str, dict] = {}
             for frac in fracs:
                 print(f"    frac={frac}…", end=" ", flush=True)
-                _apply_chars_steering(model, chars_data, frac, snap)
+                _restore_ok = True
                 try:
+                    _apply_chars_steering(model, chars_data, frac, snap)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
                     ch_results[str(frac)] = _eval_and_record()
                     tox = ch_results[str(frac)]["detoxify"]["toxicity"]["mean"]
                     ppl_r = ch_results[str(frac)]["ppl_ratio"]
                     print(f"tox={tox:.4f}  ppl_ratio={ppl_r:.3f}")
+                except RuntimeError as _exc:
+                    if "CUDA" in str(_exc).upper() or "CUBLAS" in str(_exc).upper():
+                        print(f"CUDA error at frac={frac}: {_exc!r}")
+                        cuda_ok = _restore_ok = False
+                    else:
+                        raise
                 finally:
-                    _restore_c_proj(model, snap)
+                    if _restore_ok:
+                        _restore_c_proj(model, snap)
+                if not cuda_ok:
+                    break
             results["chars_lite"] = ch_results
+            _save_incremental()
+            print(f"    [saved incrementally]")
 
     # ── 4. Vocab Shifting ─────────────────────────────────────────────────
     if not skip_vocab_shifting:
         if "vocab_shifting" in results and results["vocab_shifting"]:
             print(f"  ── vocab_shifting (already done, skipping) ──")
+        elif not cuda_ok:
+            print(f"  ── vocab_shifting (skipped – GPU context corrupted) ──")
+            results["vocab_shifting"] = {}
         else:
             print(f"  ── vocab_shifting ──")
             toxic_token_scores = _compute_toxic_token_scores(
@@ -701,29 +745,43 @@ def run_strategy_sweep(
 
             vs_results: dict[str, dict] = {}
             for frac in fracs:
-                alpha = frac * 5.0  # map [0,0.5] → [0,2.5] for logit penalty scale
+                alpha = frac * 5.0
                 print(f"    frac={frac} (α={alpha:.2f})…", end=" ", flush=True)
-                res = evaluate_vocab_shifted(
-                    model, tokenizer, prompts, toxic_token_scores,
-                    detox_model, device, owt_ref_text,
-                    alpha=alpha, max_new_tokens=max_new_tokens,
-                    temperature=temperature, top_k=top_k,
-                    llamaguard_scorer=llamaguard_scorer,
-                )
-                ppl_ratio = res["perplexity"] / max(base_ppl, 1e-6)
-                vl_ratio = res["val_loss"] / max(base_vl, 1e-6) \
-                    if not math.isnan(res["val_loss"]) else float("nan")
-                vs_results[str(frac)] = {
-                    **res, "ppl_ratio": ppl_ratio, "val_loss_ratio": vl_ratio,
-                    "alpha": alpha}
-                tox = res["detoxify"]["toxicity"]["mean"]
-                print(f"tox={tox:.4f}  ppl_ratio={ppl_ratio:.3f}")
+                try:
+                    res = evaluate_vocab_shifted(
+                        model, tokenizer, prompts, toxic_token_scores,
+                        detox_model, device, owt_ref_text,
+                        alpha=alpha, max_new_tokens=max_new_tokens,
+                        temperature=temperature, top_k=top_k,
+                        llamaguard_scorer=llamaguard_scorer,
+                    )
+                    ppl_ratio = res["perplexity"] / max(base_ppl, 1e-6)
+                    vl_ratio = res["val_loss"] / max(base_vl, 1e-6) \
+                        if not math.isnan(res["val_loss"]) else float("nan")
+                    vs_results[str(frac)] = {
+                        **res, "ppl_ratio": ppl_ratio, "val_loss_ratio": vl_ratio,
+                        "alpha": alpha}
+                    tox = res["detoxify"]["toxicity"]["mean"]
+                    print(f"tox={tox:.4f}  ppl_ratio={ppl_ratio:.3f}")
+                except RuntimeError as _exc:
+                    if "CUDA" in str(_exc).upper() or "CUBLAS" in str(_exc).upper():
+                        print(f"CUDA error at frac={frac}: {_exc!r}")
+                        cuda_ok = False
+                    else:
+                        raise
+                if not cuda_ok:
+                    break
             results["vocab_shifting"] = vs_results
+            _save_incremental()
+            print(f"    [saved incrementally]")
 
     # ── 5. PCT-OSD ────────────────────────────────────────────────────────
     if not skip_pct:
         if "pct_osd" in results and results["pct_osd"]:
             print(f"  ── pct_osd (already done, skipping) ──")
+        elif not cuda_ok:
+            print(f"  ── pct_osd (skipped – GPU context corrupted) ──")
+            results["pct_osd"] = {}
         else:
             print(f"  ── pct_osd ──")
             pct_bases, pct_svals = _compute_pct_bases(
@@ -732,15 +790,29 @@ def run_strategy_sweep(
             pct_results: dict[str, dict] = {}
             for frac in fracs:
                 print(f"    frac={frac}…", end=" ", flush=True)
-                _apply_pct_osd(model, pct_bases, pct_svals, frac, snap)
+                _restore_ok = True
                 try:
+                    _apply_pct_osd(model, pct_bases, pct_svals, frac, snap)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
                     pct_results[str(frac)] = _eval_and_record()
                     tox = pct_results[str(frac)]["detoxify"]["toxicity"]["mean"]
                     ppl_r = pct_results[str(frac)]["ppl_ratio"]
                     print(f"tox={tox:.4f}  ppl_ratio={ppl_r:.3f}")
+                except RuntimeError as _exc:
+                    if "CUDA" in str(_exc).upper() or "CUBLAS" in str(_exc).upper():
+                        print(f"CUDA error at frac={frac}: {_exc!r}")
+                        cuda_ok = _restore_ok = False
+                    else:
+                        raise
                 finally:
-                    _restore_c_proj(model, snap)
+                    if _restore_ok:
+                        _restore_c_proj(model, snap)
+                if not cuda_ok:
+                    break
             results["pct_osd"] = pct_results
+            _save_incremental()
+            print(f"    [saved incrementally]")
 
     # ── Store heuristics for replotting ───────────────────────────────────
     heur: dict = {}
@@ -748,6 +820,7 @@ def run_strategy_sweep(
         t_stats = compute_neuron_t_stats(toxic_acts, nontoxic_acts)
         heur["t_stats"] = {str(li): ts.tolist() for li, ts in t_stats.items()}
     results["heuristics"] = heur
+    _save_incremental()
 
     return results
 
@@ -912,6 +985,12 @@ def main():
                 print(f"  Baseline tox={baseline['detoxify']['toxicity']['mean']:.4f} "
                       f"ppl={baseline['perplexity']:.2f}")
 
+            # Incremental save closure — called after each method completes
+            def _save_incremental(sweep_dict, _ds=ds_key):
+                tau_results[_ds] = sweep_dict
+                with open(out_json, "w") as _f:
+                    json.dump(tau_results, _f, indent=2, allow_nan=True)
+
             sweep_result = run_strategy_sweep(
                 model=model,
                 tokenizer=tokenizer,
@@ -934,12 +1013,13 @@ def main():
                 skip_vocab_shifting=args.no_vocab_shifting,
                 skip_pct=args.no_pct,
                 existing=existing_ds,
+                save_fn=_save_incremental,
             )
             tau_results[ds_key] = sweep_result
 
-        # Save per-tau
+        # Final save per-tau (ensures everything is flushed)
         with open(out_json, "w") as f:
-            json.dump(tau_results, f, indent=2, default=str)
+            json.dump(tau_results, f, indent=2, allow_nan=True)
         print(f"  Saved → {out_json}")
         all_results[label] = tau_results
 
