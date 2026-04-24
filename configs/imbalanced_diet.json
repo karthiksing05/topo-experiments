@@ -1,0 +1,25 @@
+{
+  "_comment": "Config for the imbalanced training diet topographic FashionMNIST experiment.",
+
+  "data_dir":      null,
+  "output_dir":    null,
+
+  "hidden_size":   256,
+  "epochs":        30,
+  "total_samples": 10000,
+  "batch_size":    128,
+  "lr":            5e-4,
+  "device":        "cuda:0",
+  "print_freq":    5,
+  "seed":          42,
+
+  "_diets_note": "Class proportions [T-shirt, Trouser, Sneaker, Bag] are defined in the training script.",
+  "_variants_note": "Variants (baseline / topo_r2 / topo_r4 / topo_r8) are defined in the training script.",
+
+  "_topo_params": {
+    "topo_scale":    5.0,
+    "lambda_kl":     0.1,
+    "lambda_entropy": 2.0,
+    "_factor_note": "factor_h / factor_w vary per variant: r2=2, r4=4, r8=8"
+  }
+}
